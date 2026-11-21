@@ -14,7 +14,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "ru": {
         "start": "<b>Скачиваю видео и музыку</b>\nПришли ссылку из TikTok, Instagram, YouTube или Spotify.",
         "help": "<b>Как пользоваться</b>\n\nПришли ссылку из TikTok, Instagram, YouTube или Spotify. К видео пришлю ещё MP3 со звуком. Для Spotify найду подходящую запись и пришлю MP3.\n\nРолики YouTube длиннее 10 минут приходят только звуком, длиннее часа не скачиваются. Бот работает и в группах.",
-        "language": "🌍 Язык",
+        "language": "🌐 Язык",
         "choose_language": "<b>Выбери язык</b>",
         "back": "⬅️ Назад",
         "rate_limited": "Слишком много ссылок. Попробуй через минуту.",
@@ -39,7 +39,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "uk": {
         "start": "<b>Завантажую відео та музику</b>\nНадішли посилання з TikTok, Instagram, YouTube або Spotify.",
         "help": "<b>Як користуватися</b>\n\nНадішли посилання з TikTok, Instagram, YouTube або Spotify. До відео надішлю ще MP3 зі звуком. Для Spotify знайду відповідний запис і надішлю MP3.\n\nРолики YouTube довші за 10 хвилин приходять лише звуком, довші за годину не завантажуються. Бот працює і в групах.",
-        "language": "🌍 Мова",
+        "language": "🌐 Мова",
         "choose_language": "<b>Обери мову</b>",
         "back": "⬅️ Назад",
         "rate_limited": "Забагато посилань. Спробуй через хвилину.",
@@ -64,7 +64,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "en": {
         "start": "<b>Download videos and music</b>\nSend a TikTok, Instagram, YouTube, or Spotify link.",
         "help": "<b>How to use</b>\n\nSend a TikTok, Instagram, YouTube, or Spotify link. With a video I also send its audio as an MP3. For Spotify, I'll find a matching recording and send an MP3.\n\nYouTube videos over 10 minutes come as audio only; over an hour can't be downloaded. The bot also works in groups.",
-        "language": "🌍 Language",
+        "language": "🌐 Language",
         "choose_language": "<b>Choose a language</b>",
         "back": "⬅️ Back",
         "rate_limited": "Too many links. Try again in a minute.",
@@ -89,7 +89,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "es": {
         "start": "<b>Descarga videos y música</b>\nEnvía un enlace de TikTok, Instagram, YouTube o Spotify.",
         "help": "<b>Cómo usarlo</b>\n\nEnvía un enlace de TikTok, Instagram, YouTube o Spotify. Con un video también envío su audio en MP3. Para Spotify buscaré una grabación que coincida y enviaré un MP3.\n\nLos videos de YouTube de más de 10 minutos llegan solo como audio; los de más de una hora no se descargan. El bot también funciona en grupos.",
-        "language": "🌍 Idioma",
+        "language": "🌐 Idioma",
         "choose_language": "<b>Elige un idioma</b>",
         "back": "⬅️ Volver",
         "rate_limited": "Demasiados enlaces. Inténtalo de nuevo en un minuto.",
@@ -114,7 +114,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "pt": {
         "start": "<b>Baixe vídeos e músicas</b>\nEnvie um link do TikTok, Instagram, YouTube ou Spotify.",
         "help": "<b>Como usar</b>\n\nEnvie um link do TikTok, Instagram, YouTube ou Spotify. Junto com o vídeo também envio o áudio em MP3. Para o Spotify, encontro uma gravação correspondente e envio um MP3.\n\nVídeos do YouTube com mais de 10 minutos chegam só em áudio; com mais de uma hora não são baixados. O bot também funciona em grupos.",
-        "language": "🌍 Idioma",
+        "language": "🌐 Idioma",
         "choose_language": "<b>Escolha um idioma</b>",
         "back": "⬅️ Voltar",
         "rate_limited": "Links demais. Tente novamente em um minuto.",
@@ -139,7 +139,7 @@ TEXTS: dict[str, dict[str, str]] = {
     "tr": {
         "start": "<b>Video ve müzik indir</b>\nTikTok, Instagram, YouTube veya Spotify bağlantısı gönder.",
         "help": "<b>Nasıl kullanılır</b>\n\nTikTok, Instagram, YouTube veya Spotify bağlantısı gönder. Videoyla birlikte sesini de MP3 olarak gönderirim. Spotify için uygun kaydı bulup MP3 gönderirim.\n\n10 dakikadan uzun YouTube videoları sadece ses olarak gelir, bir saatten uzunları indirilemez. Bot gruplarda da çalışır.",
-        "language": "🌍 Dil",
+        "language": "🌐 Dil",
         "choose_language": "<b>Dil seç</b>",
         "back": "⬅️ Geri",
         "rate_limited": "Çok fazla bağlantı gönderdin. Bir dakika sonra tekrar dene.",
