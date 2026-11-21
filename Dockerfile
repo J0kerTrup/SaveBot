@@ -6,7 +6,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY bot.py downloader.py emoji.py i18n.py setup_profile.py ./
+COPY bot.py downloader.py emoji.py i18n.py setup_profile.py family_lang.py ./
 
 RUN useradd -u 10001 bot
 USER bot

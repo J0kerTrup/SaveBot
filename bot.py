@@ -19,6 +19,7 @@ from aiogram.utils.chat_action import ChatActionSender
 
 from downloader import DownloadError, download, find_links
 from emoji import premium, split_icon
+from family_lang import Family, sync_private
 from i18n import LANGS, SITE, pick, t
 
 log = logging.getLogger("savebot")
@@ -32,6 +33,8 @@ DB_PATH = os.environ.get("DB_PATH", "data/savebot.sqlite3")
 LINKS_PER_MESSAGE = 2
 
 dp = Dispatcher()
+# The language a person chose in any bot of Pixel Radio (family_lang.py).
+family = Family("PixelSaver/1.0")
 slots = asyncio.Semaphore(PARALLEL)
 recent: dict[int, deque[float]] = defaultdict(deque)
 # Повторную ссылку отдаём по file_id без нового скачивания.
@@ -101,6 +104,8 @@ async def choose_lang(query: CallbackQuery, bot: Bot) -> None:
             await query.answer(t(lang_of(msg.chat.id, query.from_user), "admins_only"), show_alert=True)
             return
     set_lang(msg.chat.id, lang)
+    if msg.chat.type == ChatType.PRIVATE:
+        await family.put(query.from_user.id, lang)
     try:
         await msg.edit_text(premium(t(lang, "start")), reply_markup=menu(lang))
     except TelegramBadRequest:
@@ -190,6 +195,24 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                 audio_id = sent.audio.file_id if sent.audio else None
 
             remember(url, video_id, audio_id)
+
+
+def _own_lang(chat_id: int) -> str | None:
+    row = db.execute("SELECT lang FROM chat_lang WHERE chat_id = ?", (chat_id,)).fetchone()
+    return row[0] if row and row[0] in LANGS else None
+
+
+@dp.message.outer_middleware()
+@dp.callback_query.outer_middleware()
+async def family_language(handler, event, data):
+    """In private, the language chosen in any bot of the family wins over this bot's own; a group keeps the language its admins
+    chose here."""
+    message = event.message if isinstance(event, CallbackQuery) else event
+    user = event.from_user
+    if user and isinstance(message, Message) and message.chat.type == ChatType.PRIVATE:
+        chat_id = message.chat.id
+        await sync_private(family, user.id, _own_lang(chat_id), lambda lang: set_lang(chat_id, lang))
+    return await handler(event, data)
 
 
 async def main() -> None:
