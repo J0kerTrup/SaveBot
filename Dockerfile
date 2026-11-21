@@ -7,6 +7,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY bot.py downloader.py emoji.py i18n.py setup_profile.py family_lang.py ./
+COPY assets/banners ./assets/banners
 
 RUN useradd -u 10001 bot
 USER bot

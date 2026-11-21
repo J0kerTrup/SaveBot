@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="586" viewBox="0 0 2000 586" role="img" aria-labelledby="title desc">
+  <title id="title">Pixel Saver</title>
+  <desc id="desc">Pixel download icon and Pixel Saver wordmark.</desc>
+  <rect width="2000" height="586" fill="#000000"/>
+  <g id="icon" transform="translate(160 149)" fill="#C8FC28">
+    <rect x="120" y="0" width="48" height="144"/>
+    <rect x="72" y="96" width="48" height="48"/>
+    <rect x="168" y="96" width="48" height="48"/>
+    <rect x="96" y="144" width="96" height="48"/>
+    <rect x="48" y="216" width="24" height="48"/>
+    <rect x="72" y="240" width="144" height="24"/>
+    <rect x="216" y="216" width="24" height="48"/>
+  </g>
+  <text x="558" y="293" dy="0.44em" fill="#F9F9FB" font-family="'Press Start 2P'" font-size="112">PIXEL SAVER</text>
+</svg>

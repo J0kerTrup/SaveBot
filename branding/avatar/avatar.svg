@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs><filter id="glow" x="-20%" y="-30%" width="140%" height="160%"><feGaussianBlur stdDeviation="24"/></filter></defs>
+  <rect width="1024" height="1024" fill="#000000"/>
+  <path d="M178 486H846L874 514V648L846 676H178L150 648V514Z" fill="#C8FC28" opacity=".35" filter="url(#glow)"/>
+  <text x="512" y="326" dy=".36em" text-anchor="middle" font-family="'Press Start 2P',monospace" font-size="142" fill="#F9F9FB">PIXEL</text>
+  <path d="M178 486H846L874 514V648L846 676H178L150 648V514Z" fill="#C8FC28"/>
+  <text x="512" y="584" dy=".36em" text-anchor="middle" font-family="'Press Start 2P',monospace" font-size="122" fill="#000000">SAVER</text>
+  <g fill="#C8FC28"><rect x="126" y="274" width="30" height="30"/><rect x="166" y="238" width="22" height="22"/><rect x="842" y="720" width="22" height="22"/><rect x="878" y="690" width="14" height="14"/></g>
+</svg>
