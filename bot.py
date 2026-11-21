@@ -31,12 +31,15 @@ PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "3"))
 PER_CHAT_PER_MINUTE = int(os.environ.get("PER_CHAT_PER_MINUTE", "6"))
 DB_PATH = os.environ.get("DB_PATH", "data/savebot.sqlite3")
 LINKS_PER_MESSAGE = 2
+# "Too many links" goes to a chat at most once a minute: a busy group must not get a reply to every message.
+WARN_EVERY = 60
 
 dp = Dispatcher()
 # The language a person chose in any bot of Pixel Radio (family_lang.py).
 family = Family("PixelSaver/1.0")
 slots = asyncio.Semaphore(PARALLEL)
 recent: dict[int, deque[float]] = defaultdict(deque)
+warned: dict[int, float] = {}
 # Повторную ссылку отдаём по file_id без нового скачивания.
 cache: OrderedDict[str, tuple[str | None, str | None]] = OrderedDict()
 CACHE_SIZE = 2000
@@ -77,18 +80,59 @@ def button(text: str, data: str | None, style: str | None = None, url: str | Non
 
 
 def menu(lang: str) -> InlineKeyboardMarkup:
-    flags = [button(label, f"lang:{code}", "success" if code == lang else None) for code, label in LANGS.items()]
     rows = [[button(t(lang, "add"), None, "primary", url=f"https://t.me/{username}?startgroup=true")]]
-    rows += [flags[i : i + 2] for i in range(0, len(flags), 2)]
+    rows.append([button(t(lang, "language"), "ui:lang")])
     rows.append([button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT"), button(t(lang, "site"), None, url=f"https://{SITE}/")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def language_menu(lang: str) -> InlineKeyboardMarkup:
+    flags = [button(label, f"lang:{code}", "success" if code == lang else None) for code, label in LANGS.items()]
+    rows = [flags[i : i + 2] for i in range(0, len(flags), 2)]
+    rows.append([button(t(lang, "back"), "ui:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def edit_ui(message: Message, text: str, markup: InlineKeyboardMarkup) -> None:
+    """Keep navigation in one message, whether it started as text or as a banner."""
+    if message.photo:
+        await message.edit_caption(caption=premium(text), reply_markup=markup)
+    else:
+        await message.edit_text(premium(text), reply_markup=markup)
+
+
 @dp.message(CommandStart())
-@dp.message(Command("lang", "help"))
 async def start(message: Message) -> None:
     lang = lang_of(message.chat.id, message.from_user)
-    await message.answer(premium(t(lang, "start")), reply_markup=menu(lang))
+    await message.answer_photo(FSInputFile("assets/banners/start.png"), caption=premium(t(lang, "start")), reply_markup=menu(lang))
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message) -> None:
+    lang = lang_of(message.chat.id, message.from_user)
+    await message.answer(premium(t(lang, "help")), reply_markup=menu(lang))
+
+
+@dp.message(Command("lang"))
+async def lang_command(message: Message) -> None:
+    lang = lang_of(message.chat.id, message.from_user)
+    await message.answer(premium(t(lang, "choose_language")), reply_markup=language_menu(lang))
+
+
+@dp.callback_query(F.data.startswith("ui:"))
+async def navigate(query: CallbackQuery) -> None:
+    msg = query.message
+    if not isinstance(msg, Message):
+        await query.answer()
+        return
+    lang = lang_of(msg.chat.id, query.from_user)
+    page = (query.data or "").split(":", 1)[1]
+    text, markup = (t(lang, "choose_language"), language_menu(lang)) if page == "lang" else (t(lang, "start"), menu(lang))
+    try:
+        await edit_ui(msg, text, markup)
+    except TelegramBadRequest:
+        pass
+    await query.answer()
 
 
 @dp.callback_query(F.data.startswith("lang:"))
@@ -107,7 +151,7 @@ async def choose_lang(query: CallbackQuery, bot: Bot) -> None:
     if msg.chat.type == ChatType.PRIVATE:
         await family.put(query.from_user.id, lang)
     try:
-        await msg.edit_text(premium(t(lang, "start")), reply_markup=menu(lang))
+        await edit_ui(msg, t(lang, "choose_language"), language_menu(lang))
     except TelegramBadRequest:
         pass  # тот же язык — текст не изменился
     await query.answer(t(lang, "lang_set"))
@@ -117,7 +161,7 @@ async def choose_lang(query: CallbackQuery, bot: Bot) -> None:
 
 
 def allowed(chat_id: int) -> bool:
-    """Не больше PER_CHAT_PER_MINUTE ссылок в минуту на чат: лишние молча пропускаем."""
+    """Не больше PER_CHAT_PER_MINUTE ссылок в минуту на чат."""
     now = time.monotonic()
     q = recent[chat_id]
     while q and now - q[0] > 60:
@@ -125,6 +169,16 @@ def allowed(chat_id: int) -> bool:
     if len(q) >= PER_CHAT_PER_MINUTE:
         return False
     q.append(now)
+    return True
+
+
+def should_warn(chat_id: int) -> bool:
+    now = time.monotonic()
+    if now - warned.get(chat_id, -WARN_EVERY) < WARN_EVERY:
+        return False
+    if len(warned) > 10_000:
+        warned.clear()
+    warned[chat_id] = now
     return True
 
 
@@ -139,8 +193,15 @@ def remember(url: str, video_id: str | None, audio_id: str | None) -> None:
 async def on_message(message: Message, bot: Bot) -> None:
     entities = (message.entities or []) + (message.caption_entities or [])
     links = find_links(message.text or message.caption, [e.url for e in entities if e.url])
+    if not links:
+        # In a group people just talk; in private a message without a link is a question the bot should answer.
+        if message.chat.type == ChatType.PRIVATE and not (message.text or "").startswith("/"):
+            await message.answer(premium(t(lang_of(message.chat.id, message.from_user), "no_link")))
+        return
     for url in links[:LINKS_PER_MESSAGE]:
         if not allowed(message.chat.id):
+            if should_warn(message.chat.id):
+                await message.reply(premium("⏳ " + t(lang_of(message.chat.id, message.from_user), "rate_limited")))
             return
         try:
             await handle(message, bot, url)
@@ -149,6 +210,7 @@ async def on_message(message: Message, bot: Bot) -> None:
             return
         except Exception:
             log.exception("Сбой на %s", url)
+            await message.reply(premium("❌ " + t(lang_of(message.chat.id, message.from_user), "unexpected")))
 
 
 async def handle(message: Message, bot: Bot, url: str) -> None:
@@ -180,6 +242,8 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                     supports_streaming=True,
                 )
                 video_id = sent.video.file_id if sent.video else None
+            elif media.long_video:
+                await message.reply(premium("❗️ " + t(lang, "long_video")))
             elif media.video_too_big:
                 await message.reply(premium("❗️ " + t(lang, "too_big")))
 
@@ -195,6 +259,12 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                 audio_id = sent.audio.file_id if sent.audio else None
 
             remember(url, video_id, audio_id)
+
+
+@dp.message(F.chat.type == ChatType.PRIVATE)
+async def not_a_link(message: Message) -> None:
+    """A sticker, voice, photo or file in private: say what the bot takes instead of staying silent."""
+    await message.answer(premium(t(lang_of(message.chat.id, message.from_user), "no_link")))
 
 
 def _own_lang(chat_id: int) -> str | None:

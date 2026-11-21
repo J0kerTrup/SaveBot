@@ -29,8 +29,12 @@ async def main() -> None:
     # None — профиль по умолчанию для языков, которых нет в списке.
     for code in [None, *PROFILE]:
         name, short, full = PROFILE[code or DEFAULT]
-        start_desc, lang_desc = COMMANDS[code or DEFAULT]
-        commands = [BotCommand(command="start", description=start_desc), BotCommand(command="lang", description=lang_desc)]
+        start_desc, lang_desc, help_desc = COMMANDS[code or DEFAULT]
+        commands = [
+            BotCommand(command="start", description=start_desc),
+            BotCommand(command="help", description=help_desc),
+            BotCommand(command="lang", description=lang_desc),
+        ]
         await call(bot, SetMyName(name=name, language_code=code))
         await call(bot, SetMyShortDescription(short_description=short, language_code=code))
         await call(bot, SetMyDescription(description=full + PROFILE_FOOTER[code or DEFAULT], language_code=code))

@@ -31,6 +31,7 @@ SPOTIFY_TRACK = re.compile(r"https?://open\.spotify\.com/(?:intl-[a-z-]+/)?track
 TELEGRAM_LIMIT = 49 * 1024 * 1024
 VIDEO_MAX_DURATION = 10 * 60  # длиннее — только звук: видео не влезет в 50 МБ
 MAX_DURATION = 60 * 60  # длиннее не влезет и звук
+MAX_FILESIZE = 150 * 1024 * 1024  # больше yt-dlp не качает
 
 SOCIAL_FORMAT = (
     # H.264 играет во всех клиентах Telegram; формат download у TikTok — с водяным знаком. Нет ролика (фото-пост) — один звук.
@@ -43,7 +44,7 @@ USER_AGENT = "Mozilla/5.0"
 
 
 class DownloadError(Exception):
-    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long)."""
+    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long, live, removed, file_too_big)."""
 
 
 @dataclass
@@ -57,6 +58,8 @@ class Media:
     height: int | None
     video_too_big: bool = False
     thumb: Path | None = None
+    # YouTube longer than VIDEO_MAX_DURATION: only the audio is sent, and the person is told why.
+    long_video: bool = False
 
 
 def kind(url: str) -> str | None:
@@ -88,7 +91,7 @@ def _options(workdir: Path, cookies: str | None, fmt: str) -> dict:
         "merge_output_format": "mp4",
         "noplaylist": True,
         "playlist_items": "1",
-        "max_filesize": 150 * 1024 * 1024,
+        "max_filesize": MAX_FILESIZE,
         "socket_timeout": 20,
         "retries": 2,
         "quiet": True,
@@ -102,6 +105,10 @@ def _options(workdir: Path, cookies: str | None, fmt: str) -> dict:
 
 def _ydl_error(e: Exception) -> DownloadError:
     msg = str(e).lower()
+    if "live event" in msg or "is live" in msg or "premieres in" in msg:
+        return DownloadError("live")
+    if "removed" in msg or "deleted" in msg or "no longer available" in msg or "video unavailable" in msg or "terminated" in msg:
+        return DownloadError("removed")
     if "login" in msg or "private" in msg or "cookies" in msg or "sign in" in msg:
         return DownloadError("private")
     if "unsupported url" in msg or "no video formats" in msg or "unavailable" in msg:
@@ -130,7 +137,9 @@ def _download(url: str, workdir: Path, cookies: str | None, fmt: str) -> tuple[d
         raise _ydl_error(e) from e
     files = [Path(d["filepath"]) for d in info.get("requested_downloads") or [] if d.get("filepath")]
     if not files or not files[0].exists():
-        raise DownloadError("failed")
+        # yt-dlp skips a file over max_filesize without an error: say so instead of a vague failure.
+        size = max((d.get("filesize") or d.get("filesize_approx") or 0) for d in info.get("requested_downloads") or [info])
+        raise DownloadError("file_too_big" if size > MAX_FILESIZE else "failed")
     return info, files[0]
 
 
@@ -291,14 +300,17 @@ def download(url: str, workdir: Path, cookies: str | None = None) -> Media:
         case "youtube":
             info = _info(url, cookies)
             if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
-                raise DownloadError("nomedia")
+                raise DownloadError("live")
             duration = info.get("duration") or 0
             if duration > MAX_DURATION:
                 raise DownloadError("too_long")
             audio_only = duration > VIDEO_MAX_DURATION
             target = info.get("webpage_url") or url
             info, src = _download(target, workdir, cookies, AUDIO_FORMAT if audio_only else YOUTUBE_FORMAT)
-            return _finish(info, src, workdir, audio_only)
+            media = _finish(info, src, workdir, audio_only)
+            if audio_only:
+                media.video_too_big, media.long_video = False, True
+            return media
         case _:
             info, src = _download(url, workdir, cookies, SOCIAL_FORMAT)
             return _finish(info, src, workdir)
