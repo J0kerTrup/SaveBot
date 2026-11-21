@@ -19,7 +19,7 @@ from aiogram.utils.chat_action import ChatActionSender
 
 from downloader import DownloadError, download, find_links
 from emoji import premium, split_icon
-from i18n import LANGS, pick, t
+from i18n import LANGS, SITE, pick, t
 
 log = logging.getLogger("savebot")
 
@@ -77,6 +77,7 @@ def menu(lang: str) -> InlineKeyboardMarkup:
     flags = [button(label, f"lang:{code}", "success" if code == lang else None) for code, label in LANGS.items()]
     rows = [[button(t(lang, "add"), None, "primary", url=f"https://t.me/{username}?startgroup=true")]]
     rows += [flags[i : i + 2] for i in range(0, len(flags), 2)]
+    rows.append([button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT"), button(t(lang, "site"), None, url=f"https://{SITE}/")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

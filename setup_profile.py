@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SetMyCommands, SetMyDescription, SetMyName, SetMyShortDescription, TelegramMethod
 from aiogram.types import BotCommand
 
-from i18n import COMMANDS, DEFAULT, PROFILE
+from i18n import COMMANDS, DEFAULT, PROFILE, PROFILE_FOOTER
 
 
 async def call(bot: Bot, method: TelegramMethod) -> None:
@@ -33,7 +33,7 @@ async def main() -> None:
         commands = [BotCommand(command="start", description=start_desc), BotCommand(command="lang", description=lang_desc)]
         await call(bot, SetMyName(name=name, language_code=code))
         await call(bot, SetMyShortDescription(short_description=short, language_code=code))
-        await call(bot, SetMyDescription(description=full, language_code=code))
+        await call(bot, SetMyDescription(description=full + PROFILE_FOOTER[code or DEFAULT], language_code=code))
         await call(bot, SetMyCommands(commands=commands, language_code=code))
         print(f"{code or 'default'}: {name}")
     await bot.session.close()

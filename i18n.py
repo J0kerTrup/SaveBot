@@ -18,6 +18,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Добавь меня в группу: буду отвечать на ссылки прямо в чате.\n\n"
         "🌍 Язык можно выбрать ниже.",
         "add": "➕ Добавить в чат",
+        "hub": "🤖 Все наши боты",
+        "site": "🌍 Сайт",
         "lang_set": "✅ Язык: Русский",
         "admins_only": "Язык чата меняют только администраторы.",
         "private": "Не получилось скачать: пост закрыт или площадка требует вход.",
@@ -34,6 +36,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Додай мене в групу: відповідатиму на посилання просто в чаті.\n\n"
         "🌍 Мову можна обрати нижче.",
         "add": "➕ Додати в чат",
+        "hub": "🤖 Усі наші боти",
+        "site": "🌍 Сайт",
         "lang_set": "✅ Мова: Українська",
         "admins_only": "Мову чату змінюють лише адміністратори.",
         "private": "Не вдалося завантажити: допис закритий або платформа вимагає вхід.",
@@ -50,6 +54,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Add me to a group and I'll answer links right in the chat.\n\n"
         "🌍 Pick your language below.",
         "add": "➕ Add to chat",
+        "hub": "🤖 All our bots",
+        "site": "🌍 Website",
         "lang_set": "✅ Language: English",
         "admins_only": "Only admins can change the chat language.",
         "private": "Couldn't download: the post is private or requires login.",
@@ -66,6 +72,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Agrégame a un grupo y responderé a los enlaces en el chat.\n\n"
         "🌍 Elige tu idioma abajo.",
         "add": "➕ Agregar al chat",
+        "hub": "🤖 Todos nuestros bots",
+        "site": "🌍 Sitio web",
         "lang_set": "✅ Idioma: Español",
         "admins_only": "Solo los administradores pueden cambiar el idioma del chat.",
         "private": "No se pudo descargar: la publicación es privada o requiere iniciar sesión.",
@@ -82,6 +90,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Adicione-me a um grupo e responderei aos links direto no chat.\n\n"
         "🌍 Escolha o idioma abaixo.",
         "add": "➕ Adicionar ao chat",
+        "hub": "🤖 Todos os nossos bots",
+        "site": "🌍 Site",
         "lang_set": "✅ Idioma: Português",
         "admins_only": "Só os administradores podem mudar o idioma do chat.",
         "private": "Não foi possível baixar: a publicação é privada ou exige login.",
@@ -98,6 +108,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "👥 Beni bir gruba ekle, bağlantılara doğrudan sohbette yanıt veririm.\n\n"
         "🌍 Dilini aşağıdan seç.",
         "add": "➕ Sohbete ekle",
+        "hub": "🤖 Tüm botlarımız",
+        "site": "🌍 Web sitesi",
         "lang_set": "✅ Dil: Türkçe",
         "admins_only": "Sohbet dilini yalnızca yöneticiler değiştirebilir.",
         "private": "İndirilemedi: gönderi gizli ya da giriş gerektiriyor.",
@@ -209,3 +221,15 @@ def pick(code: str | None) -> str:
 
 def t(lang: str, key: str) -> str:
     return TEXTS.get(lang, TEXTS[DEFAULT])[key]
+
+
+# The last lines of every profile: the bot's own site and the catalog of all the bots of Pixel Radio.
+SITE = "save.pixelradio.app"
+PROFILE_FOOTER: dict[str, str] = {
+    "ru": "\n\n🌍 save.pixelradio.app\n🤖 Все наши боты: @HUBPIXELBOT",
+    "uk": "\n\n🌍 save.pixelradio.app\n🤖 Усі наші боти: @HUBPIXELBOT",
+    "en": "\n\n🌍 save.pixelradio.app\n🤖 All our bots: @HUBPIXELBOT",
+    "es": "\n\n🌍 save.pixelradio.app\n🤖 Todos nuestros bots: @HUBPIXELBOT",
+    "pt": "\n\n🌍 save.pixelradio.app\n🤖 Todos os nossos bots: @HUBPIXELBOT",
+    "tr": "\n\n🌍 save.pixelradio.app\n🤖 Tüm botlarımız: @HUBPIXELBOT",
+}
