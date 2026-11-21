@@ -1,0 +1,11 @@
+services:
+  savebot:
+    build: .
+    container_name: savebot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/savebot.sqlite3
+    volumes:
+      # Язык чатов (savebot.sqlite3) и, если нужен Instagram, cookies.txt: COOKIES_FILE=/data/cookies.txt
+      - ./data:/data

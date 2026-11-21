@@ -1,0 +1,12 @@
+[project]
+name = "savebot"
+version = "0.1.0"
+description = "Telegram-бот: скачивает видео и звук по ссылкам TikTok и Instagram прямо в чате"
+requires-python = ">=3.13"
+dependencies = [
+    "aiogram==3.31.0",
+    "yt-dlp[default,curl-cffi]",
+]
+
+[tool.ruff]
+line-length = 140
