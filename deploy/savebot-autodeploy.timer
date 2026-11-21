@@ -1,0 +1,10 @@
+[Unit]
+Description=Look for new main of SaveBot every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Unit=savebot-autodeploy.service
+
+[Install]
+WantedBy=timers.target

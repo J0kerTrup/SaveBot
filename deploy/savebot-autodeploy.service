@@ -1,0 +1,9 @@
+[Unit]
+Description=Deploy new main of SaveBot from GitHub
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/savebot/autodeploy.sh
+TimeoutStartSec=20min

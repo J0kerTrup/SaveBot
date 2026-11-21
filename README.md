@@ -42,3 +42,10 @@ Spotify: только ссылки на треки (и spotify.link). Звук S
 ## Обновление yt-dlp
 
 Площадки часто меняют API — обновляй yt-dlp: `uv lock --upgrade-package yt-dlp`, затем пересобери образ.
+
+## Сервер и выкатка
+
+Работает на `root@92.118.232.237` в контейнере `savebot`: `/opt/savebot/.env` (600) и `/opt/savebot/data/` (база, cookies.txt) живут только там.
+Выкатка — push в `main` на GitHub (`J0kerTrup/SaveBot`): таймер `savebot-autodeploy` раз в минуту берёт новый `main`,
+собирает образ и меняет контейнер; если он не продержался 30 секунд без перезапуска — возвращает прежний. Журнал:
+`journalctl -u savebot-autodeploy`. Сборка ждёт, пока на диске не будет 2 ГБ свободно.
