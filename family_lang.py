@@ -7,6 +7,7 @@ two variables the bot simply works on its own.
 
 import logging
 import os
+import re
 import time
 
 import aiohttp
@@ -78,7 +79,17 @@ class Family:
             await self._session.close()
 
 
-async def sync_private(family: Family, user_id: int, local: str | None, set_local) -> None:
+# A link made in the admin of Pixel Hub may name the language of those it is for: /start l_<code>_<lang>.
+_LINK = re.compile(r"/start(?:@\w+)?\s+l_[a-z2-7]{8}_([a-z]{2})")
+
+
+def link_lang(text: str | None) -> str | None:
+    """The language of the link a person came by."""
+    match = _LINK.fullmatch((text or "").strip())
+    return match[1] if match and match[1] in LANGS else None
+
+
+async def sync_private(family: Family, user_id: int, local: str | None, set_local, text: str | None = None) -> None:
     """Before a bot answers a person in private: their family language becomes the bot's own setting; a bot's own choice made
     before the family had one is given to the family, so nobody loses what they chose."""
     shared = await family.get(user_id)
@@ -86,3 +97,6 @@ async def sync_private(family: Family, user_id: int, local: str | None, set_loca
         set_local(shared)
     elif shared is None and local:
         await family.put(user_id, local)
+    elif shared is None and (came := link_lang(text)):
+        # Only for someone who has chosen nothing yet; with the next message it goes to the family as any choice made here.
+        set_local(came)

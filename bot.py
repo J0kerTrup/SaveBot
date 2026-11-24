@@ -17,6 +17,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 from aiogram.utils.chat_action import ChatActionSender
 
+import family_refs
 from downloader import DownloadError, download, find_links
 from emoji import premium, split_icon
 from family_lang import Family, sync_private
@@ -42,6 +43,8 @@ family = Family("PixelSaver/1.0")
 stats = Stats(Path(DB_PATH).parent / "stats.sqlite3", ("start", "help", "lang"))
 dp.message.outer_middleware(stats.middleware)
 dp.callback_query.outer_middleware(stats.middleware)
+# Added to a group, taken out of it.
+dp.my_chat_member.register(stats.membership)
 slots = asyncio.Semaphore(PARALLEL)
 recent: dict[int, deque[float]] = defaultdict(deque)
 warned: dict[int, float] = {}
@@ -86,7 +89,7 @@ def button(text: str, data: str | None, style: str | None = None, url: str | Non
 
 def menu(lang: str) -> InlineKeyboardMarkup:
     rows = [[button(t(lang, "add"), None, "primary", url=f"https://t.me/{username}?startgroup=true")]]
-    rows.append([button(t(lang, "language"), "ui:lang")])
+    rows.append([button(family_refs.button(lang), "ui:ref"), button(t(lang, "language"), "ui:lang")])
     rows.append(
         [
             button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT?start=bot_saver"),
@@ -137,6 +140,19 @@ async def navigate(query: CallbackQuery) -> None:
         return
     lang = lang_of(msg.chat.id, query.from_user)
     page = (query.data or "").split(":", 1)[1]
+    if page == "ref":
+        stats.hit("press", "invite")
+        if msg.chat.type != ChatType.PRIVATE:
+            await query.answer(family_refs.private_only(lang), show_alert=True)
+            return
+        share = button(family_refs.share(lang), None, "primary", url=family_refs.share_url(stats, username, query.from_user.id))
+        rows = [[share], [button(t(lang, "back"), "ui:home")]]
+        try:
+            await edit_ui(msg, family_refs.screen(stats, username, query.from_user.id, lang), InlineKeyboardMarkup(inline_keyboard=rows))
+        except TelegramBadRequest:
+            pass
+        await query.answer()
+        return
     text, markup = (t(lang, "choose_language"), language_menu(lang)) if page == "lang" else (t(lang, "start"), menu(lang))
     try:
         await edit_ui(msg, text, markup)
@@ -300,7 +316,9 @@ async def family_language(handler, event, data):
     user = event.from_user
     if user and isinstance(message, Message) and message.chat.type == ChatType.PRIVATE:
         chat_id = message.chat.id
-        await sync_private(family, user.id, _own_lang(chat_id), lambda lang: set_lang(chat_id, lang))
+        await sync_private(
+            family, user.id, _own_lang(chat_id), lambda lang: set_lang(chat_id, lang), event.text if isinstance(event, Message) else None
+        )
     return await handler(event, data)
 
 
@@ -311,7 +329,7 @@ async def main() -> None:
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
     username = me.username or ""
-    caption = premium(os.environ.get("CAPTION") or f"📥 @{username}")
+    caption = premium(os.environ.get("CAPTION") or f'📥 <a href="https://t.me/{username}?start=chat">@{username}</a>')
     log.info("Запущен @%s", username)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
