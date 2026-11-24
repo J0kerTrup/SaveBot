@@ -90,7 +90,7 @@ def menu(lang: str) -> InlineKeyboardMarkup:
     rows.append(
         [
             button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT?start=bot_saver"),
-            button(t(lang, "site"), None, url=f"https://{SITE}/"),
+            button(t(lang, "site"), None, url=f"https://{SITE}/?from=bot_saver"),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -78,8 +78,8 @@ class Stats:
         digest = hmac.new(self._key, str(user_id).encode(), hashlib.sha256).digest()
         return int.from_bytes(digest[:8], "big") >> 1
 
-    def hit(self, kind: str, value: str, now: float | None = None):
-        if self.db is None:
+    def hit(self, kind: str, value: str, now: float | None = None, times: int = 1):
+        if self.db is None or times < 1:
             return
         at = int(time.time() if now is None else now)
         hour, who = at // 3600, _who.get()
@@ -91,8 +91,8 @@ class Stats:
                     if count.fetchone()[0] >= MAX_VALUES:
                         value = "other"
                 self.db.execute(
-                    "INSERT INTO family_stats VALUES (?, ?, ?, 1) ON CONFLICT (hour, kind, value) DO UPDATE SET n = n + 1",
-                    (hour, kind, value),
+                    "INSERT INTO family_stats VALUES (?, ?, ?, ?) ON CONFLICT (hour, kind, value) DO UPDATE SET n = n + excluded.n",
+                    (hour, kind, value, times),
                 )
                 if who is not None and kind != "start":
                     self.db.execute("INSERT INTO events (at, who, what) VALUES (?, ?, ?)", (at, who, f"{kind}:{value}"))
