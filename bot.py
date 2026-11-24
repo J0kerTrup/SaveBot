@@ -20,6 +20,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from downloader import DownloadError, download, find_links
 from emoji import premium, split_icon
 from family_lang import Family, sync_private
+from family_stats import Stats
 from i18n import LANGS, SITE, pick, t
 
 log = logging.getLogger("savebot")
@@ -37,6 +38,10 @@ WARN_EVERY = 60
 dp = Dispatcher()
 # The language a person chose in any bot of Pixel Radio (family_lang.py).
 family = Family("PixelSaver/1.0")
+# What people do here, in numbers only, for the map of Pixel Hub's admin (family_stats.py).
+stats = Stats(Path(DB_PATH).parent / "stats.sqlite3", ("start", "help", "lang"))
+dp.message.outer_middleware(stats.middleware)
+dp.callback_query.outer_middleware(stats.middleware)
 slots = asyncio.Semaphore(PARALLEL)
 recent: dict[int, deque[float]] = defaultdict(deque)
 warned: dict[int, float] = {}
@@ -82,7 +87,12 @@ def button(text: str, data: str | None, style: str | None = None, url: str | Non
 def menu(lang: str) -> InlineKeyboardMarkup:
     rows = [[button(t(lang, "add"), None, "primary", url=f"https://t.me/{username}?startgroup=true")]]
     rows.append([button(t(lang, "language"), "ui:lang")])
-    rows.append([button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT"), button(t(lang, "site"), None, url=f"https://{SITE}/")])
+    rows.append(
+        [
+            button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT?start=bot_saver"),
+            button(t(lang, "site"), None, url=f"https://{SITE}/"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -200,9 +210,11 @@ async def on_message(message: Message, bot: Bot) -> None:
         return
     for url in links[:LINKS_PER_MESSAGE]:
         if not allowed(message.chat.id):
+            stats.hit("result", "limited")
             if should_warn(message.chat.id):
                 await message.reply(premium("⏳ " + t(lang_of(message.chat.id, message.from_user), "rate_limited")))
             return
+        stats.hit("result", "link")
         try:
             await handle(message, bot, url)
         except TelegramRetryAfter as e:
@@ -210,12 +222,14 @@ async def on_message(message: Message, bot: Bot) -> None:
             return
         except Exception:
             log.exception("Сбой на %s", url)
+            stats.hit("result", "fail")
             await message.reply(premium("❌ " + t(lang_of(message.chat.id, message.from_user), "unexpected")))
 
 
 async def handle(message: Message, bot: Bot, url: str) -> None:
     if url in cache:
         video_id, audio_id = cache[url]
+        stats.hit("result", "cached")
         if video_id:
             await message.reply_video(video_id, caption=caption)
         if audio_id and (SEND_AUDIO or not video_id):
@@ -228,6 +242,7 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
             try:
                 media = await asyncio.to_thread(download, url, Path(tmp), COOKIES)
             except DownloadError as e:
+                stats.hit("result", "fail")
                 await message.reply(premium("❌ " + t(lang, str(e))))
                 return
 
@@ -242,9 +257,12 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                     supports_streaming=True,
                 )
                 video_id = sent.video.file_id if sent.video else None
+                stats.hit("result", "video")
             elif media.long_video:
+                stats.hit("result", "big")
                 await message.reply(premium("❗️ " + t(lang, "long_video")))
             elif media.video_too_big:
+                stats.hit("result", "big")
                 await message.reply(premium("❗️ " + t(lang, "too_big")))
 
             if media.audio and (SEND_AUDIO or not media.video):
@@ -257,6 +275,7 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                     thumbnail=FSInputFile(media.thumb) if media.thumb else None,
                 )
                 audio_id = sent.audio.file_id if sent.audio else None
+                stats.hit("result", "audio")
 
             remember(url, video_id, audio_id)
 
