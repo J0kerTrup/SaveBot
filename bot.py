@@ -21,6 +21,8 @@ import family_refs
 from downloader import DownloadError, download, find_links
 from emoji import premium, split_icon
 from family_lang import Family, sync_private
+from family_news import News
+from family_news import button as news_button
 from family_stats import Stats
 from i18n import LANGS, SITE, pick, t
 
@@ -89,7 +91,8 @@ def button(text: str, data: str | None, style: str | None = None, url: str | Non
 
 def menu(lang: str) -> InlineKeyboardMarkup:
     rows = [[button(t(lang, "add"), None, "primary", url=f"https://t.me/{username}?startgroup=true")]]
-    rows.append([button(family_refs.button(lang), "ui:ref"), button(t(lang, "language"), "ui:lang")])
+    rows.append([button(family_refs.button(lang), "ui:ref"), button(news_button(lang), "news")])
+    rows.append([button(t(lang, "language"), "ui:lang")])
     rows.append(
         [
             button(t(lang, "hub"), None, url="https://t.me/HUBPIXELBOT?start=bot_saver"),
@@ -112,6 +115,11 @@ async def edit_ui(message: Message, text: str, markup: InlineKeyboardMarkup) -> 
         await message.edit_caption(caption=premium(text), reply_markup=markup)
     else:
         await message.edit_text(premium(text), reply_markup=markup)
+
+
+# News for those who asked for them (family_news.py): what to send and when comes from Pixel Hub.
+news = News("saver", Path(DB_PATH).parent / "news.sqlite3", lambda user_id: _own_lang(user_id), "ui:home", premium=premium)
+dp.include_router(news.router())
 
 
 @dp.message(CommandStart())
@@ -331,7 +339,11 @@ async def main() -> None:
     username = me.username or ""
     caption = premium(os.environ.get("CAPTION") or f'📥 <a href="https://t.me/{username}?start=chat">@{username}</a>')
     log.info("Запущен @%s", username)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    sending = asyncio.create_task(news.run(bot))
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        sending.cancel()
 
 
 if __name__ == "__main__":
