@@ -8,6 +8,11 @@ In a group only what the bot did for somebody is an event: a command, a press, a
 a group its title is kept, and whether the bot is still in it; its ID is hashed as a person's is.
 Counting never breaks an answer: an error of the database is one line in the log.
 
+A try (`attempt`) is one thing the bot is asked to do, followed from the request to its end: accepted → started → done with an outcome
+and a reason. It has a random number of its own; the same update delivered again is the same try (a keyed hash of its chat, message
+and link, nothing of them is kept). A transition from a card of Pixel Hub (`/start hc_<id>`) is counted as the tag «hub_card», and
+its random id is kept for two days, without a person, so that the hub's collector can tell how many card opens ended here.
+
 The file is the same in every bot of the family written in Python; the hub's collector reads stats.sqlite3 next to the bot's own
 database and takes only numbers out of it.
 """
@@ -45,7 +50,19 @@ CREATE TABLE IF NOT EXISTS invites (invitee INTEGER PRIMARY KEY, inviter INTEGER
 CREATE INDEX IF NOT EXISTS invites_inviter ON invites (inviter);
 CREATE TABLE IF NOT EXISTS chats (chat INTEGER PRIMARY KEY, title TEXT NOT NULL, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL,
     inside INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS family_meta (name TEXT PRIMARY KEY, since INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, mark INTEGER NOT NULL UNIQUE, who INTEGER, chat INTEGER,
+    accepted_ms INTEGER NOT NULL, started_ms INTEGER, done_ms INTEGER, outcome TEXT, reason TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS attempts_accepted ON attempts (accepted_ms);
+CREATE TABLE IF NOT EXISTS handoffs (tid TEXT PRIMARY KEY, at INTEGER NOT NULL);
 """
+# The outcomes of a try and why it ended so; the collector counts only these words.
+OUTCOMES = ("ok", "fail")
+REASONS = ("timeout", "unsupported", "unavailable", "too_big", "download", "processing", "delivery", "other")
+_DETAIL = re.compile(r"[a-z_]{1,24}")
+# A card of Pixel Hub: the random id of one opening of a card (HubBot catalog), kept HANDOFF_DAYS here.
+_HANDOFF = re.compile(r"hc_([a-z2-7]{10})")
+HANDOFF_DAYS = 2
 # Whose update is being answered: an explicit hit() of a handler belongs to them. None in groups and outside of updates.
 _who: ContextVar[int | None] = ContextVar("family_stats_who", default=None)
 # In which group it is, if it is one.
@@ -62,6 +79,8 @@ def start_tag(arg: str) -> str:
     arg = arg.strip().lower()
     if not arg:
         return "organic"
+    if _HANDOFF.fullmatch(arg):
+        return "hub_card"
     if arg.startswith(("ref_", "r_")):
         return "ref"
     return arg if _TAG.fullmatch(arg) and not any(len(run) > 5 for run in re.findall(r"\d+", arg)) else "unknown"
@@ -84,6 +103,9 @@ class Stats:
             now = int(time.time())
             with self.db:
                 self.db.execute("INSERT OR IGNORE INTO family_stats_meta VALUES (1, ?)", (now,))
+                # Since when tries and card transitions are followed: before it, there are only the counters of results.
+                self.db.execute("INSERT OR IGNORE INTO family_meta VALUES ('attempts', ?)", (now,))
+                self.db.execute("INSERT OR IGNORE INTO family_meta VALUES ('handoffs', ?)", (now,))
                 self.db.execute("INSERT OR IGNORE INTO family_key VALUES (1, ?, ?)", (secrets.token_bytes(32), now))
             self._key = self.db.execute("SELECT key FROM family_key").fetchone()[0]
         except (OSError, sqlite3.Error) as error:
@@ -124,6 +146,8 @@ class Stats:
                     self.db.execute("DELETE FROM events WHERE at < ?", (old,))
                     self.db.execute("DELETE FROM people WHERE last_at < ?", (old,))
                     self.db.execute("DELETE FROM chats WHERE last_at < ? AND NOT inside", (old,))
+                    self.db.execute("DELETE FROM attempts WHERE accepted_ms < ?", (old * 1000,))
+                    self.db.execute("DELETE FROM handoffs WHERE at < ?", (at - HANDOFF_DAYS * 86_400,))
         except sqlite3.Error as error:
             log.warning("Счётчик не записан: %s", type(error).__name__)
 
@@ -197,9 +221,62 @@ class Stats:
             return "direct"
         tag = start_tag(arg)
         self.hit("start", tag)
+        if found := _HANDOFF.fullmatch(arg.strip().lower()):
+            self.handoff(found.group(1))
         if (who := _who.get()) is not None:
             self.invite(arg, who)
         return tag
+
+    def handoff(self, tid: str, now: float | None = None):
+        """A card of Pixel Hub led here: its id, once, with the time; no person."""
+        if self.db is None:
+            return
+        with suppress(sqlite3.Error), self.db:
+            self.db.execute("INSERT OR IGNORE INTO handoffs VALUES (?, ?)", (tid, int(time.time() if now is None else now)))
+
+    # -- tries: a request followed to its end ----------------------------------------------------------------------------------------
+
+    def attempt(self, key: str, now: float | None = None) -> tuple[str | None, str]:
+        """A try of `key` (chat, message, link): its id, and «new», «open» (the same update again, not finished) or «done»
+        (finished already: do not do it again). None without a database: the bot works on, unfollowed."""
+        if self.db is None:
+            return None, "new"
+        ms = int((time.time() if now is None else now) * 1000)
+        mark = int.from_bytes(hmac.new(self._key, b"attempt:" + key.encode(), hashlib.sha256).digest()[:8], "big") >> 1
+        try:
+            with self.db:
+                made = self.db.execute(
+                    "INSERT OR IGNORE INTO attempts (id, mark, who, chat, accepted_ms) VALUES (?, ?, ?, ?, ?)",
+                    (secrets.token_hex(8), mark, _who.get(), _chat.get(), ms),
+                ).rowcount
+                id_, outcome = self.db.execute("SELECT id, outcome FROM attempts WHERE mark = ?", (mark,)).fetchone()
+        except sqlite3.Error as error:
+            log.warning("Попытка не записана: %s", type(error).__name__)
+            return None, "new"
+        return id_, "new" if made else ("done" if outcome else "open")
+
+    def started(self, id_: str | None, now: float | None = None):
+        """The work began (a slot was free): the first time only."""
+        if self.db is None or id_ is None:
+            return
+        ms = int((time.time() if now is None else now) * 1000)
+        with suppress(sqlite3.Error), self.db:
+            self.db.execute("UPDATE attempts SET started_ms = ? WHERE id = ? AND started_ms IS NULL", (ms, id_))
+
+    def finished(self, id_: str | None, outcome: str, reason: str | None = None, detail: str | None = None, now: float | None = None):
+        """The end of a try: the first end stays, a later one (a repeated update) changes nothing."""
+        if self.db is None or id_ is None or outcome not in OUTCOMES:
+            return
+        if outcome == "fail" and reason not in REASONS:
+            reason = "other"
+        detail = detail if detail and _DETAIL.fullmatch(detail) else None
+        ms = int((time.time() if now is None else now) * 1000)
+        with suppress(sqlite3.Error), self.db:
+            self.db.execute(
+                "UPDATE attempts SET started_ms = coalesce(started_ms, ?), done_ms = ?, outcome = ?, reason = ?, detail = ?"
+                " WHERE id = ? AND outcome IS NULL",
+                (ms, ms, outcome, reason if outcome == "fail" else None, detail, id_),
+            )
 
     def button(self, data: str | None):
         name = self.press(data or "")

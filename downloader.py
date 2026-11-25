@@ -43,8 +43,26 @@ AUDIO_FORMAT = "ba[ext=m4a]/ba/b"
 USER_AGENT = "Mozilla/5.0"
 
 
+# What a refusal is, for the analytics: the source, the size, the download, the processing or the time (family_stats.REASONS).
+WHY = {
+    "private": "unavailable",
+    "removed": "unavailable",
+    "notfound": "unavailable",
+    "live": "unavailable",
+    "nomedia": "unavailable",
+    "too_long": "too_big",
+    "file_too_big": "too_big",
+    "failed": "download",
+}
+
+
 class DownloadError(Exception):
-    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long, live, removed, file_too_big)."""
+    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long, live, removed, file_too_big). `why` — для счёта:
+    тот же текст человеку бывает у разных причин (площадка не поддерживается и ролика нет — оба «nomedia»)."""
+
+    def __init__(self, code: str, why: str | None = None):
+        super().__init__(code)
+        self.code, self.why = code, why or WHY.get(code, "download")
 
 
 @dataclass
@@ -105,6 +123,10 @@ def _options(workdir: Path, cookies: str | None, fmt: str) -> dict:
 
 def _ydl_error(e: Exception) -> DownloadError:
     msg = str(e).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return DownloadError("failed", "timeout")
+    if "unsupported url" in msg:
+        return DownloadError("nomedia", "unsupported")
     if "live event" in msg or "is live" in msg or "premieres in" in msg:
         return DownloadError("live")
     if "removed" in msg or "deleted" in msg or "no longer available" in msg or "video unavailable" in msg or "terminated" in msg:
@@ -232,6 +254,8 @@ def _meta(page: str, name: str) -> str | None:
 def _spotify(url: str, workdir: Path, cookies: str | None) -> Media:
     try:
         final, body = _get(url)
+    except TimeoutError as e:
+        raise DownloadError("failed", "timeout") from e
     except OSError as e:
         raise DownloadError("failed") from e
     if not SPOTIFY_TRACK.match(final):
@@ -261,7 +285,7 @@ def _spotify(url: str, workdir: Path, cookies: str | None) -> Media:
             best = min(close, key=lambda e: abs(e["duration"] - duration))
 
     info, src = _download(best["url"], workdir, cookies, AUDIO_FORMAT)
-    media = _finish(info, src, workdir, audio_only=True)
+    media = _processed(info, src, workdir, audio_only=True)
     media.video_too_big = False
     media.title = _short(title) or media.title
     media.performer = _short(artist) or media.performer
@@ -292,6 +316,16 @@ def _cover(url: str | None, workdir: Path) -> Path | None:
 # --- вход --------------------------------------------------------------------
 
 
+def _processed(info: dict, src: Path, workdir: Path, audio_only: bool = False) -> Media:
+    """_finish, whose failures of ffmpeg are a failure of processing, not of the download."""
+    try:
+        return _finish(info, src, workdir, audio_only)
+    except subprocess.TimeoutExpired as e:
+        raise DownloadError("failed", "timeout") from e
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError) as e:
+        raise DownloadError("failed", "processing") from e
+
+
 def download(url: str, workdir: Path, cookies: str | None = None) -> Media:
     """Синхронно: вызывать через asyncio.to_thread."""
     match kind(url):
@@ -307,10 +341,10 @@ def download(url: str, workdir: Path, cookies: str | None = None) -> Media:
             audio_only = duration > VIDEO_MAX_DURATION
             target = info.get("webpage_url") or url
             info, src = _download(target, workdir, cookies, AUDIO_FORMAT if audio_only else YOUTUBE_FORMAT)
-            media = _finish(info, src, workdir, audio_only)
+            media = _processed(info, src, workdir, audio_only)
             if audio_only:
                 media.video_too_big, media.long_video = False, True
             return media
         case _:
             info, src = _download(url, workdir, cookies, SOCIAL_FORMAT)
-            return _finish(info, src, workdir)
+            return _processed(info, src, workdir)

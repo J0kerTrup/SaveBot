@@ -12,7 +12,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 from aiogram.utils.chat_action import ChatActionSender
@@ -238,19 +238,35 @@ async def on_message(message: Message, bot: Bot) -> None:
             if should_warn(message.chat.id):
                 await message.reply(premium("⏳ " + t(lang_of(message.chat.id, message.from_user), "rate_limited")))
             return
-        stats.hit("result", "link")
+        # One try per link of a message: the same update delivered again goes on with it, or is left alone if it is done.
+        attempt, state = stats.attempt(f"{message.chat.id}:{message.message_id}:{url}")
+        if state == "done":
+            continue
+        if state == "new":
+            stats.hit("result", "link")
         try:
-            await handle(message, bot, url)
+            await handle(message, bot, url, attempt)
         except TelegramRetryAfter as e:
+            stats.finished(attempt, "fail", "delivery", "flood")
             log.warning("FloodWait %s с в чате %s", e.retry_after, message.chat.id)
             return
-        except Exception:
+        except Exception as e:
             log.exception("Сбой на %s", url)
             stats.hit("result", "fail")
+            stats.finished(attempt, "fail", *failure_of(e))
             await message.reply(premium("❌ " + t(lang_of(message.chat.id, message.from_user), "unexpected")))
 
 
-async def handle(message: Message, bot: Bot, url: str) -> None:
+def failure_of(error: Exception) -> tuple[str, str]:
+    """What an unexpected error was, for the count of tries: the time, the delivery to Telegram, or something else."""
+    if isinstance(error, TimeoutError | TelegramNetworkError):
+        return "timeout", "delivery"
+    if isinstance(error, TelegramAPIError):
+        return "delivery", "telegram"
+    return "other", "unexpected"
+
+
+async def handle(message: Message, bot: Bot, url: str, attempt: str | None = None) -> None:
     if url in cache:
         video_id, audio_id = cache[url]
         stats.hit("result", "cached")
@@ -258,15 +274,18 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
             await message.reply_video(video_id, caption=caption)
         if audio_id and (SEND_AUDIO or not video_id):
             await message.reply_audio(audio_id, caption=caption)
+        stats.finished(attempt, "ok", detail="cached")
         return
 
     lang = lang_of(message.chat.id, message.from_user)
     async with slots, ChatActionSender.upload_video(bot=bot, chat_id=message.chat.id, message_thread_id=message.message_thread_id):
+        stats.started(attempt)
         with tempfile.TemporaryDirectory(prefix="savebot-") as tmp:
             try:
                 media = await asyncio.to_thread(download, url, Path(tmp), COOKIES)
             except DownloadError as e:
                 stats.hit("result", "fail")
+                stats.finished(attempt, "fail", e.why, e.code)
                 await message.reply(premium("❌ " + t(lang, str(e))))
                 return
 
@@ -282,6 +301,8 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                 )
                 video_id = sent.video.file_id if sent.video else None
                 stats.hit("result", "video")
+                # The file has come: the try is a success, whatever happens to the track after it.
+                stats.finished(attempt, "ok", detail="video")
             elif media.long_video:
                 stats.hit("result", "big")
                 await message.reply(premium("❗️ " + t(lang, "long_video")))
@@ -300,8 +321,12 @@ async def handle(message: Message, bot: Bot, url: str) -> None:
                 )
                 audio_id = sent.audio.file_id if sent.audio else None
                 stats.hit("result", "audio")
+                stats.finished(attempt, "ok", detail="audio")
 
-            remember(url, video_id, audio_id)
+            if video_id or audio_id:
+                remember(url, video_id, audio_id)
+            # Nothing was sent: the video was too big and there was no track to send instead.
+            stats.finished(attempt, "fail", "too_big", "no_file")
 
 
 @dp.message(F.chat.type == ChatType.PRIVATE)
