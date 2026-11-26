@@ -1,12 +1,16 @@
-"""Бот-скачивалка: в группе или в личке кидаешь ссылку TikTok/Instagram — получаешь видео и трек ответом."""
+"""Бот-скачивалка: в группе или в личке кидаешь ссылку TikTok, Instagram, YouTube или Spotify — получаешь файлы ответом."""
 
 import asyncio
+import html
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from collections import OrderedDict, defaultdict, deque
+from contextlib import suppress
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -14,17 +18,30 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaAudio,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+    ReplyParameters,
+    User,
+)
 from aiogram.utils.chat_action import ChatActionSender
 
+import downloader
 import family_refs
-from downloader import DownloadError, download, find_links
+from downloader import SMALL_LIMIT, DownloadError, File, Playlist, download, find_links, is_profile, spotify_track
 from emoji import premium, split_icon
 from family_lang import Family, sync_private
 from family_news import News
 from family_news import button as news_button
 from family_stats import Stats
 from i18n import LANGS, SITE, pick, t
+from uploader import Uploader
 
 log = logging.getLogger("savebot")
 
@@ -35,6 +52,11 @@ PARALLEL = int(os.environ.get("PARALLEL_DOWNLOADS", "3"))
 PER_CHAT_PER_MINUTE = int(os.environ.get("PER_CHAT_PER_MINUTE", "6"))
 DB_PATH = os.environ.get("DB_PATH", "data/savebot.sqlite3")
 LINKS_PER_MESSAGE = 2
+# Spotify: сколько треков альбома или плейлиста присылать в личке и в группе (в группе — чтобы не завалить разговор).
+PLAYLIST_PRIVATE = int(os.environ.get("PLAYLIST_PRIVATE", "50"))
+PLAYLIST_GROUP = int(os.environ.get("PLAYLIST_GROUP", "10"))
+# Сообщение о ходе загрузки или плейлиста меняется не чаще раза в столько секунд.
+PROGRESS_EVERY = 8
 # "Too many links" goes to a chat at most once a minute: a busy group must not get a reply to every message.
 WARN_EVERY = 60
 
@@ -48,10 +70,14 @@ dp.callback_query.outer_middleware(stats.middleware)
 # Added to a group, taken out of it.
 dp.my_chat_member.register(stats.membership)
 slots = asyncio.Semaphore(PARALLEL)
+# Файлы больше 50 МБ — по MTProto под токеном бота (uploader.py).
+uploader = Uploader(TOKEN)
+# Чаты, где сейчас идёт плейлист: второй ждёт конца первого.
+playlists: set[int] = set()
 recent: dict[int, deque[float]] = defaultdict(deque)
 warned: dict[int, float] = {}
-# Повторную ссылку отдаём по file_id без нового скачивания.
-cache: OrderedDict[str, tuple[str | None, str | None]] = OrderedDict()
+# Повторную ссылку отдаём по file_id (или копией большого файла) без нового скачивания; ключ — ссылка или «spotify:track:ID».
+cache: OrderedDict[str, list[tuple]] = OrderedDict()
 CACHE_SIZE = 2000
 caption = ""
 username = ""
@@ -216,9 +242,10 @@ def should_warn(chat_id: int) -> bool:
     return True
 
 
-def remember(url: str, video_id: str | None, audio_id: str | None) -> None:
-    cache[url] = (video_id, audio_id)
-    cache.move_to_end(url)
+def remember(key: str, refs: list[tuple]) -> None:
+    """Что ушло по ссылке: ("video"|"audio"|"photo", file_id) или ("copy", chat_id, message_id) — файл больше 50 МБ."""
+    cache[key] = refs
+    cache.move_to_end(key)
     while len(cache) > CACHE_SIZE:
         cache.popitem(last=False)
 
@@ -227,6 +254,9 @@ def remember(url: str, video_id: str | None, audio_id: str | None) -> None:
 async def on_message(message: Message, bot: Bot) -> None:
     entities = (message.entities or []) + (message.caption_entities or [])
     links = find_links(message.text or message.caption, [e.url for e in entities if e.url])
+    if message.chat.type != ChatType.PRIVATE:
+        # In a group a profile is mentioned in talk, not asked for: its posts go only to private.
+        links = [u for u in links if not is_profile(u)]
     if not links:
         # In a group people just talk; in private a message without a link is a question the bot should answer.
         if message.chat.type == ChatType.PRIVATE and not (message.text or "").startswith("/"):
@@ -266,14 +296,191 @@ def failure_of(error: Exception) -> tuple[str, str]:
     return "other", "unexpected"
 
 
+# --- отправка ----------------------------------------------------------------
+
+
+async def obey(make):
+    """Telegram просит подождать (FloodWait): ждём сколько сказано, если это не дольше минуты, и пробуем ещё раз — один."""
+    try:
+        return await make()
+    except TelegramRetryAfter as e:
+        if e.retry_after > 60:
+            raise
+        await asyncio.sleep(e.retry_after + 1)
+        return await make()
+
+
+def _reply(message: Message) -> ReplyParameters:
+    return ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True)
+
+
+def _size(path: Path) -> str:
+    size = path.stat().st_size
+    return f"{size / 2**30:.2f} ГБ".replace(".", ",") if size >= 2**30 else f"{size / 2**20:.0f} МБ"
+
+
+def _video_thumb(path: Path) -> Path | None:
+    """Кадр для превью большого видео: по MTProto Telegram сам его не делает."""
+    thumb = path.with_suffix(".thumb.jpg")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", str(path), "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", str(thumb)],
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+        return thumb if thumb.exists() and thumb.stat().st_size < 200_000 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+async def send_big(message: Message, file: File, lang: str) -> tuple:
+    """Файл больше 50 МБ — по MTProto, с одним сообщением о ходе загрузки, которое потом исчезает."""
+    status = await obey(lambda: message.reply(premium("⏫ " + t(lang, "uploading").format(size=_size(file.path), percent=0))))
+    last = time.monotonic()
+
+    async def progress(done: int, total: int) -> None:
+        nonlocal last
+        if time.monotonic() - last < PROGRESS_EVERY or not total:
+            return
+        last = time.monotonic()
+        text = premium("⏫ " + t(lang, "uploading").format(size=_size(file.path), percent=done * 100 // total))
+        with suppress(TelegramAPIError):
+            await status.edit_text(text)
+
+    thumb = file.thumb or (await asyncio.to_thread(_video_thumb, file.path) if file.kind == "video" else None)
+    try:
+        sent = await uploader.send(
+            message.chat.id,
+            message.message_id,
+            file.path,
+            file.kind,
+            caption,
+            title=file.title,
+            performer=file.performer,
+            duration=file.duration,
+            width=file.width,
+            height=file.height,
+            thumb=thumb,
+            filename=file.filename,
+            progress=progress,
+        )
+    finally:
+        with suppress(TelegramAPIError):
+            await status.delete()
+    return ("copy", message.chat.id, sent)
+
+
+async def send_one(message: Message, file: File, lang: str) -> tuple:
+    """Один файл: до 50 МБ — через Bot API (file_id в кеш), больше — по MTProto."""
+    if file.path.stat().st_size > SMALL_LIMIT and uploader.enabled:
+        return await send_big(message, file, lang)
+    upload = FSInputFile(file.path, filename=file.filename or file.path.name)
+    if file.kind == "video":
+        sent = await obey(
+            lambda: message.reply_video(
+                upload, caption=caption, duration=file.duration, width=file.width, height=file.height, supports_streaming=True
+            )
+        )
+        return ("video", sent.video.file_id if sent.video else None)
+    if file.kind == "audio":
+        thumb = FSInputFile(file.thumb) if file.thumb else None
+        sent = await obey(
+            lambda: message.reply_audio(
+                upload, caption=caption, title=file.title, performer=file.performer, duration=file.duration, thumbnail=thumb
+            )
+        )
+        return ("audio", sent.audio.file_id if sent.audio else None)
+    sent = await obey(lambda: message.reply_photo(upload, caption=caption))
+    return ("photo", sent.photo[-1].file_id if sent.photo else None)
+
+
+def _input(item: File | tuple, with_caption: bool):
+    """Элемент альбома: свежий файл или file_id из кеша."""
+    text = caption if with_caption else None
+    if isinstance(item, tuple):
+        what, media = item
+    else:
+        what, media = item.kind, FSInputFile(item.path, filename=item.filename or item.path.name)
+    if what == "photo":
+        return InputMediaPhoto(media=media, caption=text)
+    if what == "video":
+        extra = {} if isinstance(item, tuple) else {"duration": item.duration, "width": item.width, "height": item.height}
+        return InputMediaVideo(media=media, caption=text, supports_streaming=True, **extra)
+    extra = {} if isinstance(item, tuple) else {"title": item.title, "performer": item.performer, "duration": item.duration}
+    if not isinstance(item, tuple) and item.thumb:
+        extra["thumbnail"] = FSInputFile(item.thumb)
+    return InputMediaAudio(media=media, caption=text, **extra)
+
+
+def _ref(sent: Message) -> tuple:
+    if sent.video:
+        return ("video", sent.video.file_id)
+    if sent.audio:
+        return ("audio", sent.audio.file_id)
+    if sent.photo:
+        return ("photo", sent.photo[-1].file_id)
+    return ("copy", sent.chat.id, sent.message_id)
+
+
+async def send_ref(message: Message, ref: tuple) -> tuple:
+    """Один файл из кеша: file_id отправляется заново, большой файл — копией уже отправленного сообщения."""
+    if ref[0] == "copy":
+        sent = await obey(
+            lambda: message.bot.copy_message(
+                message.chat.id, ref[1], ref[2], caption=caption, reply_parameters=_reply(message),
+                message_thread_id=message.message_thread_id,
+            )
+        )  # fmt: skip
+        return ("copy", message.chat.id, sent.message_id)
+    send = getattr(message, f"reply_{ref[0]}")
+    await obey(lambda: send(ref[1], caption=caption))
+    return ref
+
+
+async def send_many(message: Message, items: list[File | tuple], lang: str) -> list[tuple]:
+    """Файлы и ссылки кеша альбомами по 10 (фото с видео вместе, звук отдельно); большие и копии — по одному."""
+    refs: list[tuple] = []
+    group: list[File | tuple] = []
+
+    def kind_of(item: File | tuple) -> str:
+        return item[0] if isinstance(item, tuple) else item.kind
+
+    async def flush() -> None:
+        if len(group) == 1:
+            item = group[0]
+            refs.append(await send_one(message, item, lang) if isinstance(item, File) else await send_ref(message, item))
+        elif group:
+            media = [_input(item, i == 0) for i, item in enumerate(group)]
+            sent = await obey(lambda: message.reply_media_group(media))
+            refs.extend(_ref(s) for s in sent)
+        group.clear()
+
+    for item in items:
+        alone = kind_of(item) == "copy" or (isinstance(item, File) and item.path.stat().st_size > SMALL_LIMIT)
+        if alone or (group and (kind_of(item) == "audio") != (kind_of(group[0]) == "audio")):
+            await flush()
+        if alone:
+            refs.append(await send_one(message, item, lang) if isinstance(item, File) else await send_ref(message, item))
+            continue
+        group.append(item)
+        if len(group) == 10:
+            await flush()
+    await flush()
+    return refs
+
+
+async def resend(message: Message, refs: list[tuple]) -> None:
+    await send_many(message, refs, lang_of(message.chat.id, message.from_user))
+
+
+# --- ссылка ------------------------------------------------------------------
+
+
 async def handle(message: Message, bot: Bot, url: str, attempt: str | None = None) -> None:
     if url in cache:
-        video_id, audio_id = cache[url]
         stats.hit("result", "cached")
-        if video_id:
-            await message.reply_video(video_id, caption=caption)
-        if audio_id and (SEND_AUDIO or not video_id):
-            await message.reply_audio(audio_id, caption=caption)
+        await resend(message, cache[url])
         stats.finished(attempt, "ok", detail="cached")
         return
 
@@ -282,24 +489,25 @@ async def handle(message: Message, bot: Bot, url: str, attempt: str | None = Non
         stats.started(attempt)
         with tempfile.TemporaryDirectory(prefix="savebot-") as tmp:
             try:
-                media = await asyncio.to_thread(download, url, Path(tmp), COOKIES)
+                result = await asyncio.to_thread(download, url, Path(tmp), COOKIES, uploader.limit)
             except DownloadError as e:
                 stats.hit("result", "fail")
                 stats.finished(attempt, "fail", e.why, e.code)
                 await message.reply(premium("❌ " + t(lang, str(e))))
                 return
+            if isinstance(result, Playlist):
+                await deliver_playlist(message, result, Path(tmp), lang, attempt)
+                return
+            media = result
 
-            video_id = audio_id = None
+            refs: list[tuple] = []
+            if media.gallery:
+                refs += await send_many(message, list(media.gallery), lang)
+                stats.hit("result", "gallery")
+                stats.finished(attempt, "ok", detail="gallery")
             if media.video:
-                sent = await message.reply_video(
-                    FSInputFile(media.video, filename="video.mp4"),
-                    caption=caption,
-                    duration=media.duration,
-                    width=media.width,
-                    height=media.height,
-                    supports_streaming=True,
-                )
-                video_id = sent.video.file_id if sent.video else None
+                file = File(media.video, "video", duration=media.duration, width=media.width, height=media.height, filename="video.mp4")
+                refs.append(await send_one(message, file, lang))
                 stats.hit("result", "video")
                 # The file has come: the try is a success, whatever happens to the track after it.
                 stats.finished(attempt, "ok", detail="video")
@@ -311,22 +519,83 @@ async def handle(message: Message, bot: Bot, url: str, attempt: str | None = Non
                 await message.reply(premium("❗️ " + t(lang, "too_big")))
 
             if media.audio and (SEND_AUDIO or not media.video):
-                sent = await message.reply_audio(
-                    FSInputFile(media.audio, filename=f"{media.title}.mp3"),
-                    caption=caption,
-                    title=media.title,
-                    performer=media.performer,
-                    duration=media.duration,
-                    thumbnail=FSInputFile(media.thumb) if media.thumb else None,
-                )
-                audio_id = sent.audio.file_id if sent.audio else None
+                name = media.audio_name or f"{media.title}{media.audio.suffix}"
+                file = File(media.audio, "audio", media.title, media.performer, media.duration, thumb=media.thumb, filename=name)
+                refs.append(await send_one(message, file, lang))
                 stats.hit("result", "audio")
                 stats.finished(attempt, "ok", detail="audio")
 
-            if video_id or audio_id:
-                remember(url, video_id, audio_id)
+            refs = [r for r in refs if r and r[-1]]
+            if refs:
+                remember(url, refs)
             # Nothing was sent: the video was too big and there was no track to send instead.
             stats.finished(attempt, "fail", "too_big", "no_file")
+
+
+async def deliver_playlist(message: Message, playlist: Playlist, workdir: Path, lang: str, attempt: str | None) -> None:
+    """Альбом, плейлист или топ исполнителя: треки качаются по одному и уходят альбомами по 10; одно сообщение о ходе."""
+    private = message.chat.type == ChatType.PRIVATE
+    cap = PLAYLIST_PRIVATE if private else PLAYLIST_GROUP
+    ids = playlist.ids[:cap]
+    if message.chat.id in playlists:
+        await message.reply(premium("⏳ " + t(lang, "playlist_busy")))
+        stats.finished(attempt, "fail", "other", "busy")
+        return
+    playlists.add(message.chat.id)
+    title = html.escape(playlist.title)
+    status = await obey(lambda: message.reply(premium("🎵 " + t(lang, "playlist").format(title=title, done=0, total=len(ids)))))
+    last = time.monotonic()
+    sent = missed = 0
+    pending: list[tuple[str, File | tuple]] = []
+
+    async def flush() -> None:
+        nonlocal sent
+        if not pending:
+            return
+        refs = await send_many(message, [item for _, item in pending], lang)
+        for (track_id, _), ref in zip(pending, refs, strict=False):
+            if ref and ref[-1]:
+                remember(f"spotify:track:{track_id}", [ref])
+        sent += len(pending)
+        for track_id, item in pending:
+            if isinstance(item, File):
+                shutil.rmtree(workdir / track_id, ignore_errors=True)
+        pending.clear()
+
+    try:
+        for i, track_id in enumerate(ids, 1):
+            cached = cache.get(f"spotify:track:{track_id}")
+            if cached:
+                pending.append((track_id, cached[0]))
+            else:
+                try:
+                    file = await asyncio.to_thread(spotify_track, track_id, workdir, COOKIES, uploader.limit)
+                    pending.append((track_id, file))
+                except DownloadError:
+                    missed += 1
+            if len(pending) == 10:
+                await flush()
+            if time.monotonic() - last >= PROGRESS_EVERY:
+                last = time.monotonic()
+                with suppress(TelegramAPIError):
+                    await status.edit_text(premium("🎵 " + t(lang, "playlist").format(title=title, done=i, total=len(ids))))
+        await flush()
+    finally:
+        playlists.discard(message.chat.id)
+
+    text = "✅ " + t(lang, "playlist_done").format(title=title, sent=sent, total=len(ids))
+    if missed:
+        text += "\n" + t(lang, "playlist_missed").format(n=missed)
+    if len(playlist.ids) > len(ids):
+        text += "\n" + t(lang, "playlist_cut_private" if private else "playlist_cut_group").format(n=len(ids))
+    with suppress(TelegramAPIError):
+        await status.edit_text(premium(text))
+    if sent:
+        stats.hit("result", "playlist")
+        stats.finished(attempt, "ok", detail="playlist")
+    else:
+        stats.hit("result", "fail")
+        stats.finished(attempt, "fail", "unavailable", "notfound")
 
 
 @dp.message(F.chat.type == ChatType.PRIVATE)
@@ -359,6 +628,8 @@ async def main() -> None:
     global caption, username, db
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     db = open_db()
+    downloader.setup(COOKIES)
+    await uploader.start()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
     username = me.username or ""
@@ -369,6 +640,7 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         sending.cancel()
+        await uploader.stop()
 
 
 if __name__ == "__main__":

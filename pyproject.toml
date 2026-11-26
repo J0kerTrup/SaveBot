@@ -1,11 +1,15 @@
 [project]
 name = "savebot"
 version = "0.1.0"
-description = "Telegram-бот: скачивает видео и звук по ссылкам TikTok и Instagram прямо в чате"
+description = "Telegram-бот: скачивает видео, фото и музыку из TikTok, Instagram, YouTube и Spotify прямо в чате, файлы до 2 ГБ"
 requires-python = ">=3.13"
 dependencies = [
     "aiogram==3.31.0",
+    "cryptg>=0.6.1",
+    "instaloader>=4.16",
+    "telethon>=1.46.0",
     "yt-dlp[default,curl-cffi]",
+    "ytmusicapi>=1.12.4",
 ]
 
 [tool.ruff]

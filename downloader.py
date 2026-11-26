@@ -1,19 +1,24 @@
-"""Скачивание по ссылке: yt-dlp достаёт ролик, ffmpeg вынимает из него звук.
+"""Скачивание по ссылке: yt-dlp достаёт ролик, ffmpeg вынимает из него звук; Instagram — instaloader (instagram.py),
+Spotify — сведения со страниц Spotify и запись с YouTube Music (spotify.py), фото-посты TikTok — слайды и трек.
 
-Spotify отдаёт звук только под DRM, его не обходим: со страницы трека берём название, исполнителя, длительность
-и обложку, а сам трек ищем на YouTube.
+Spotify отдаёт звук только под DRM, его не обходим. Закрытые профили, платный доступ и DRM бот не обходит.
 """
 
-import html
 import json
 import re
+import shutil
 import subprocess
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+
+import instagram
+import spotify
+from instagram import Instagram, InstagramError
+from spotify import SpotifyError, Tracklist
 
 # Ссылки, на которые бот реагирует. Добавить площадку — дописать домен сюда и в kind().
 LINK_RE = re.compile(
@@ -25,22 +30,36 @@ YOUTUBE_VIDEO = re.compile(
     r"https?://(?:[a-z0-9-]+\.)*(?:youtu\.be/[\w-]{6,}|youtube\.com/(?:watch\?(?:\S*&)?v=|shorts/|embed/|live/)[\w-]{6,})",
     re.IGNORECASE,
 )
-SPOTIFY_TRACK = re.compile(r"https?://open\.spotify\.com/(?:intl-[a-z-]+/)?track/[A-Za-z0-9]{10,}", re.IGNORECASE)
+TIKTOK_PHOTO = re.compile(r"https?://(?:www\.)?tiktok\.com/@([\w.-]+)/photo/(\d+)", re.IGNORECASE)
 
-# Бот через обычный Bot API отправляет файлы до 50 МБ.
-TELEGRAM_LIMIT = 49 * 1024 * 1024
-VIDEO_MAX_DURATION = 10 * 60  # длиннее — только звук: видео не влезет в 50 МБ
-MAX_DURATION = 60 * 60  # длиннее не влезет и звук
-MAX_FILESIZE = 150 * 1024 * 1024  # больше yt-dlp не качает
+# Через Bot API бот отправляет файлы до 50 МБ, по MTProto — до 2 ГБ (uploader.py). limit в download() — из uploader.
+SMALL_LIMIT = 49 * 1024 * 1024
+# С лимитом 50 МБ: длиннее 10 минут — только звук, длиннее часа не влезет и звук.
+SMALL_VIDEO_DURATION, SMALL_DURATION = 10 * 60, 60 * 60
+# С MTProto: видео до 3 часов (720p — около 1,5 ГБ), звук до 5 часов.
+BIG_VIDEO_DURATION, BIG_DURATION = 3 * 60 * 60, 5 * 60 * 60
+# С лимитом 50 МБ yt-dlp всё же качает до 150 МБ: из большого ролика достаётся звук.
+SMALL_DOWNLOAD = 150 * 1024 * 1024
+# Свободное место, которое скачивание не трогает: автодеплою нужно 2 ГБ, логам и базам — ещё немного.
+DISK_RESERVE = 2_500 * 1024 * 1024
+GALLERY_ITEM_MAX = 200 * 1024 * 1024  # один файл из поста или сторис
 
 SOCIAL_FORMAT = (
     # H.264 играет во всех клиентах Telegram; формат download у TikTok — с водяным знаком. Нет ролика (фото-пост) — один звук.
     "b[vcodec^=avc][format_id!=download]/b[vcodec^=h264][format_id!=download]/bv*[vcodec^=avc]+ba/b[format_id!=download]/bv*+ba/ba/b*"
 )
-YOUTUBE_FORMAT = "bv*[height<=720][vcodec^=avc]+ba[ext=m4a]/b[height<=720][vcodec^=avc]/bv*[height<=720]+ba/b[height<=720]/b"
 AUDIO_FORMAT = "ba[ext=m4a]/ba/b"
-# С полным User-Agent браузера Spotify отдаёт страницу без метатегов, с коротким — с ними.
 USER_AGENT = "Mozilla/5.0"
+BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+
+def youtube_format(limit: int) -> str:
+    """До 720p в H.264; каждая дорожка — не больше лимита отправки (размер неизвестен — не мешает)."""
+    cap = f"[filesize<?{limit}][filesize_approx<?{limit}]"
+    return (
+        f"bv*[height<=720][vcodec^=avc]{cap}+ba[ext=m4a]/b[height<=720][vcodec^=avc]{cap}/"
+        f"bv*[height<=720]{cap}+ba/b[height<=720]{cap}/bv*[height<=480]+ba/b"
+    )
 
 
 # What a refusal is, for the analytics: the source, the size, the download, the processing or the time (family_stats.REASONS).
@@ -50,6 +69,9 @@ WHY = {
     "notfound": "unavailable",
     "live": "unavailable",
     "nomedia": "unavailable",
+    "login": "unavailable",
+    "expired": "unavailable",
+    "busy": "download",
     "too_long": "too_big",
     "file_too_big": "too_big",
     "failed": "download",
@@ -57,12 +79,28 @@ WHY = {
 
 
 class DownloadError(Exception):
-    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long, live, removed, file_too_big). `why` — для счёта:
-    тот же текст человеку бывает у разных причин (площадка не поддерживается и ролика нет — оба «nomedia»)."""
+    """Причина отказа: код из i18n (private, nomedia, notfound, failed, too_long, live, removed, file_too_big, login, busy,
+    expired). `why` — для счёта: тот же текст человеку бывает у разных причин (площадка не поддерживается и ролика нет — оба
+    «nomedia»)."""
 
     def __init__(self, code: str, why: str | None = None):
         super().__init__(code)
         self.code, self.why = code, why or WHY.get(code, "download")
+
+
+@dataclass
+class File:
+    """Один файл для отправки: video, audio или photo."""
+
+    path: Path
+    kind: str
+    title: str | None = None
+    performer: str | None = None
+    duration: int | None = None
+    width: int | None = None
+    height: int | None = None
+    thumb: Path | None = None
+    filename: str | None = None
 
 
 @dataclass
@@ -76,20 +114,55 @@ class Media:
     height: int | None
     video_too_big: bool = False
     thumb: Path | None = None
-    # YouTube longer than VIDEO_MAX_DURATION: only the audio is sent, and the person is told why.
+    # YouTube longer than the video limit: only the audio is sent, and the person is told why.
     long_video: bool = False
+    # A carousel, slides, stories or a profile: photos and videos sent as albums before the audio.
+    gallery: list[File] = field(default_factory=list)
+    audio_name: str | None = None
+
+
+@dataclass
+class Playlist:
+    """Альбом, плейлист или топ исполнителя Spotify: треки качаются по одному (spotify_track)."""
+
+    kind: str
+    title: str
+    owner: str | None
+    ids: list[str]
+
+
+ig: Instagram | None = None
+
+
+def setup(cookies: str | None) -> None:
+    global ig
+    ig = Instagram(cookies)
+
+
+def _instagram() -> Instagram:
+    global ig
+    if ig is None:
+        ig = Instagram(None)
+    return ig
 
 
 def kind(url: str) -> str | None:
-    """youtube, spotify, social (TikTok, Instagram) или None — такую ссылку бот пропускает молча."""
+    """youtube, spotify, instagram, tiktok или None — такую ссылку бот пропускает молча."""
     host = (urlparse(url).hostname or "").lower()
     if host.endswith(("youtube.com", "youtu.be")):
         return "youtube" if YOUTUBE_VIDEO.match(url) else None
     if host.endswith("spotify.com"):
-        return "spotify" if SPOTIFY_TRACK.match(url) else None
+        return "spotify" if spotify.LINK.match(url) else None
     if host == "spotify.link":
         return "spotify"
-    return "social"
+    if host.endswith(("instagram.com", "instagr.am")):
+        return "instagram" if instagram.target(url) else None
+    return "tiktok"
+
+
+def is_profile(url: str) -> bool:
+    """Ссылка на профиль Instagram: в группах её просто упоминают в разговоре, скачивать по ней — только в личке."""
+    return kind(url) == "instagram" and (instagram.target(url) or ("",))[0] == "profile"
 
 
 def find_links(text: str | None, extra: list[str] | None = None) -> list[str]:
@@ -99,17 +172,23 @@ def find_links(text: str | None, extra: list[str] | None = None) -> list[str]:
     return [u for u in dict.fromkeys(found) if kind(u)]
 
 
+def room(workdir: Path, limit: int) -> int:
+    """Сколько можно скачать, не съев место на диске: файл и его копия при склейке, плюс запас для сервера."""
+    free = shutil.disk_usage(workdir).free - DISK_RESERVE
+    return max(SMALL_LIMIT, min(limit, free // 2))
+
+
 # --- yt-dlp ------------------------------------------------------------------
 
 
-def _options(workdir: Path, cookies: str | None, fmt: str) -> dict:
+def _options(workdir: Path, cookies: str | None, fmt: str, max_size: int = SMALL_DOWNLOAD) -> dict:
     opts = {
         "outtmpl": str(workdir / "%(id).60s.%(ext)s"),
         "format": fmt,
         "merge_output_format": "mp4",
         "noplaylist": True,
         "playlist_items": "1",
-        "max_filesize": MAX_FILESIZE,
+        "max_filesize": max_size,
         "socket_timeout": 20,
         "retries": 2,
         "quiet": True,
@@ -117,7 +196,11 @@ def _options(workdir: Path, cookies: str | None, fmt: str) -> dict:
         "noprogress": True,
     }
     if cookies:
-        opts["cookiefile"] = cookies
+        # yt-dlp writes the jar back on close: it gets a copy, the session file stays as the owner put it.
+        copy = workdir / "cookies.txt"
+        if not copy.exists():
+            shutil.copyfile(cookies, copy)
+        opts["cookiefile"] = str(copy)
     return opts
 
 
@@ -131,9 +214,11 @@ def _ydl_error(e: Exception) -> DownloadError:
         return DownloadError("live")
     if "removed" in msg or "deleted" in msg or "no longer available" in msg or "video unavailable" in msg or "terminated" in msg:
         return DownloadError("removed")
+    if "429" in msg or "too many requests" in msg or "rate-limit" in msg:
+        return DownloadError("busy")
     if "login" in msg or "private" in msg or "cookies" in msg or "sign in" in msg:
         return DownloadError("private")
-    if "unsupported url" in msg or "no video formats" in msg or "unavailable" in msg:
+    if "no video formats" in msg or "unavailable" in msg:
         return DownloadError("nomedia")
     return DownloadError("failed")
 
@@ -142,18 +227,18 @@ def _first(info: dict) -> dict:
     return next(iter(info["entries"]), None) or {} if info.get("entries") else info
 
 
-def _info(url: str, cookies: str | None) -> dict:
+def _info(url: str, workdir: Path, cookies: str | None) -> dict:
     """Сведения о ролике без скачивания: длительность решает, качать ли видео."""
     try:
-        with yt_dlp.YoutubeDL({**_options(Path("."), cookies, "b"), "skip_download": True, "ignore_no_formats_error": True}) as ydl:
+        with yt_dlp.YoutubeDL({**_options(workdir, cookies, "b"), "skip_download": True, "ignore_no_formats_error": True}) as ydl:
             return _first(ydl.extract_info(url, download=False))
     except yt_dlp.utils.DownloadError as e:
         raise _ydl_error(e) from e
 
 
-def _download(url: str, workdir: Path, cookies: str | None, fmt: str) -> tuple[dict, Path]:
+def _download(url: str, workdir: Path, cookies: str | None, fmt: str, max_size: int = SMALL_DOWNLOAD) -> tuple[dict, Path]:
     try:
-        with yt_dlp.YoutubeDL(_options(workdir, cookies, fmt)) as ydl:
+        with yt_dlp.YoutubeDL(_options(workdir, cookies, fmt, max_size)) as ydl:
             info = _first(ydl.extract_info(url, download=True))
     except yt_dlp.utils.DownloadError as e:
         raise _ydl_error(e) from e
@@ -161,7 +246,7 @@ def _download(url: str, workdir: Path, cookies: str | None, fmt: str) -> tuple[d
     if not files or not files[0].exists():
         # yt-dlp skips a file over max_filesize without an error: say so instead of a vague failure.
         size = max((d.get("filesize") or d.get("filesize_approx") or 0) for d in info.get("requested_downloads") or [info])
-        raise DownloadError("file_too_big" if size > MAX_FILESIZE else "failed")
+        raise DownloadError("file_too_big" if size > max_size else "failed")
     return info, files[0]
 
 
@@ -170,7 +255,7 @@ def _download(url: str, workdir: Path, cookies: str | None, fmt: str) -> tuple[d
 
 def _probe(path: Path) -> dict:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration", "-of", "json", str(path)],
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:format=duration", "-of", "json", str(path)],
         capture_output=True,
         text=True,
         timeout=60,
@@ -179,15 +264,17 @@ def _probe(path: Path) -> dict:
     return json.loads(out.stdout)
 
 
-def _extract_audio(src: Path, dst: Path, duration: float | None) -> None:
-    # Длинный трек сжимаем сильнее, чтобы mp3 влез в 50 МБ: час — около 100 кбит/с.
-    kbps = 192 if not duration else max(48, min(192, int(TELEGRAM_LIMIT * 8 * 0.95 / duration / 1000)))
-    subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", f"{kbps}k", str(dst)],
-        capture_output=True,
-        timeout=600,
-        check=True,
-    )
+def _extract_audio(src: Path, workdir: Path, duration: float | None, codec: str | None, limit: int) -> Path:
+    """Звук из ролика: AAC — без перекодирования в m4a (секунды даже для часа), иначе — mp3, сжатый под лимит."""
+    if codec == "aac":
+        dst = workdir / "audio.m4a"
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-map", "0:a:0", "-c:a", "copy", "-movflags", "+faststart"]
+    else:
+        dst = workdir / "audio.mp3"
+        kbps = 192 if not duration else max(48, min(192, int(limit * 8 * 0.95 / duration / 1000)))
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    subprocess.run([*cmd, str(dst)], capture_output=True, timeout=1800, check=True)
+    return dst
 
 
 def _short(text: str | None, limit: int = 64) -> str | None:
@@ -197,31 +284,30 @@ def _short(text: str | None, limit: int = 64) -> str | None:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _finish(info: dict, src: Path, workdir: Path, audio_only: bool = False) -> Media:
+def _finish(info: dict, src: Path, workdir: Path, audio_only: bool = False, limit: int = SMALL_LIMIT) -> Media:
     probe = _probe(src)
     streams = probe.get("streams", [])
     vstream = None if audio_only else next((s for s in streams if s.get("codec_type") == "video" and s.get("width")), None)
-    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    astream = next((s for s in streams if s.get("codec_type") == "audio"), None)
     raw = probe.get("format", {}).get("duration") or info.get("duration")
     duration = float(raw) if raw else None
 
     audio = None
-    if has_audio:
-        audio = workdir / "audio.mp3"
-        _extract_audio(src, audio, duration)
-        if audio.stat().st_size > TELEGRAM_LIMIT:
+    if astream:
+        audio = _extract_audio(src, workdir, duration, astream.get("codec_name"), limit)
+        if audio.stat().st_size > limit:
             audio = None
 
     video = None
     too_big = audio_only
     if vstream:
-        if src.stat().st_size <= TELEGRAM_LIMIT:
+        if src.stat().st_size <= limit:
             video = src
         else:
             too_big = True
 
     if not video and not audio:
-        raise DownloadError("too_long" if has_audio else "nomedia")
+        raise DownloadError("too_long" if astream else "nomedia")
 
     artists = info.get("artists") or []
     uploader = (info.get("uploader") or "").removesuffix(" - Topic") or None
@@ -237,114 +323,230 @@ def _finish(info: dict, src: Path, workdir: Path, audio_only: bool = False) -> M
     )
 
 
-# --- Spotify -----------------------------------------------------------------
-
-
-def _get(url: str, limit: int = 3_000_000) -> tuple[str, bytes]:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en"})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return response.geturl(), response.read(limit)
-
-
-def _meta(page: str, name: str) -> str | None:
-    m = re.search(rf'<meta[^>]+(?:property|name)="{re.escape(name)}"[^>]+content="([^"]*)"', page)
-    return html.unescape(m.group(1)).strip() if m else None
-
-
-def _spotify(url: str, workdir: Path, cookies: str | None) -> Media:
-    try:
-        final, body = _get(url)
-    except TimeoutError as e:
-        raise DownloadError("failed", "timeout") from e
-    except OSError as e:
-        raise DownloadError("failed") from e
-    if not SPOTIFY_TRACK.match(final):
-        raise DownloadError("nomedia")  # spotify.link вёл на альбом, плейлист или подкаст
-    page = body.decode("utf-8", "replace")
-    title = _meta(page, "og:title")
-    artist = _meta(page, "music:musician_description") or (_meta(page, "og:description") or "").split(" · ")[0] or None
-    length = _meta(page, "music:duration")
-    duration = int(length) if length and length.isdigit() else None
-    if not title:
-        raise DownloadError("notfound")
-
-    query = f"{artist} - {title}" if artist else title
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True}) as ydl:
-            found = ydl.extract_info(f"ytsearch5:{query}", download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise DownloadError("failed") from e
-    entries = [e for e in found.get("entries") or [] if e.get("url") and (e.get("duration") or 0) <= MAX_DURATION]
-    if not entries:
-        raise DownloadError("notfound")
-    best = entries[0]
-    if duration:
-        # Среди первых результатов — самый близкий по длительности: клип с интро и часовая версия проигрывают.
-        close = [e for e in entries if e.get("duration") and abs(e["duration"] - duration) <= 15]
-        if close:
-            best = min(close, key=lambda e: abs(e["duration"] - duration))
-
-    info, src = _download(best["url"], workdir, cookies, AUDIO_FORMAT)
-    media = _processed(info, src, workdir, audio_only=True)
-    media.video_too_big = False
-    media.title = _short(title) or media.title
-    media.performer = _short(artist) or media.performer
-    media.thumb = _cover(_meta(page, "og:image"), workdir)
-    return media
-
-
-def _cover(url: str | None, workdir: Path) -> Path | None:
-    """Обложка для mp3: Telegram берёт JPEG до 320 px и 200 КБ."""
-    if not url or not url.startswith("https://"):
-        return None
-    try:
-        _, data = _get(url, 5_000_000)
-        raw = workdir / "cover.src"
-        raw.write_bytes(data)
-        thumb = workdir / "cover.jpg"
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(raw), "-vf", "scale=320:320", "-q:v", "4", str(thumb)],
-            capture_output=True,
-            timeout=60,
-            check=True,
-        )
-        return thumb if thumb.stat().st_size < 200_000 else None
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-# --- вход --------------------------------------------------------------------
-
-
-def _processed(info: dict, src: Path, workdir: Path, audio_only: bool = False) -> Media:
+def _processed(info: dict, src: Path, workdir: Path, audio_only: bool = False, limit: int = SMALL_LIMIT) -> Media:
     """_finish, whose failures of ffmpeg are a failure of processing, not of the download."""
     try:
-        return _finish(info, src, workdir, audio_only)
+        return _finish(info, src, workdir, audio_only, limit)
     except subprocess.TimeoutExpired as e:
         raise DownloadError("failed", "timeout") from e
     except (subprocess.SubprocessError, OSError, ValueError, KeyError) as e:
         raise DownloadError("failed", "processing") from e
 
 
-def download(url: str, workdir: Path, cookies: str | None = None) -> Media:
-    """Синхронно: вызывать через asyncio.to_thread."""
+def _fetch(url: str, dst: Path, limit: int, agent: str = BROWSER_AGENT) -> Path:
+    """Файл по прямому адресу (CDN Instagram, TikTok, Spotify), не больше limit байт."""
+    request = urllib.request.Request(url, headers={"User-Agent": agent})
+    size = 0
+    with urllib.request.urlopen(request, timeout=30) as response, dst.open("wb") as out:
+        while chunk := response.read(1 << 16):
+            size += len(chunk)
+            if size > limit:
+                raise DownloadError("file_too_big")
+            out.write(chunk)
+    return dst
+
+
+def _photo(src: Path, dst: Path) -> File:
+    """Фото для Telegram: JPEG, большая сторона не больше 2560 px (webp и heic Telegram как фото не берёт)."""
+    scale = "scale='min(2560,iw)':'min(2560,ih)':force_original_aspect_ratio=decrease"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf", scale, "-frames:v", "1", "-q:v", "3", str(dst)],
+        capture_output=True,
+        timeout=120,
+        check=True,
+    )
+    return File(dst, "photo")
+
+
+def _video_file(path: Path) -> File:
+    probe = _probe(path)
+    v = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), {})
+    raw = probe.get("format", {}).get("duration")
+    return File(path, "video", duration=round(float(raw)) if raw else None, width=v.get("width"), height=v.get("height"))
+
+
+def _gallery(items: list[tuple[str, str]], workdir: Path, limit: int) -> list[File]:
+    files = []
+    for i, (what, url) in enumerate(items):
+        try:
+            raw = _fetch(url, workdir / f"item{i}.src", min(limit, GALLERY_ITEM_MAX))
+            if what == "photo":
+                files.append(_photo(raw, workdir / f"item{i}.jpg"))
+            else:
+                files.append(_video_file(raw.rename(workdir / f"item{i}.mp4")))
+        except (OSError, subprocess.SubprocessError, ValueError, DownloadError):
+            continue  # один битый слайд не отменяет остальные
+    return files
+
+
+# --- Spotify -----------------------------------------------------------------
+
+
+def _cover(url: str | None, workdir: Path, name: str = "cover") -> tuple[Path | None, Path | None]:
+    """Обложка: полная (640 px, внутрь файла) и миниатюра для Telegram (JPEG до 320 px и 200 КБ)."""
+    if not url or not url.startswith("https://"):
+        return None, None
+    try:
+        full = _fetch(url, workdir / f"{name}.jpg", 5_000_000, USER_AGENT)
+        thumb = workdir / f"{name}-thumb.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(full), "-vf", "scale=320:320", "-q:v", "4", str(thumb)],
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+        return full, thumb if thumb.stat().st_size < 200_000 else None
+    except (OSError, subprocess.SubprocessError, DownloadError):
+        return None, None
+
+
+def spotify_track(track_id: str, workdir: Path, cookies: str | None = None, limit: int = SMALL_LIMIT) -> File:
+    """Один трек Spotify файлом с тегами и обложкой. Синхронно."""
+    try:
+        want = spotify.track(track_id)
+    except SpotifyError as e:
+        raise DownloadError(str(e)) from e
+    if want.duration and want.duration > BIG_DURATION:
+        raise DownloadError("too_long")
+    found = spotify.match(want)
+    if not found:
+        raise DownloadError("notfound")
+    sub = workdir / track_id
+    sub.mkdir(exist_ok=True)
+    _, src = _download(found, sub, cookies, AUDIO_FORMAT, max(limit, SMALL_DOWNLOAD))
+    cover, thumb = _cover(want.cover, sub)
+    try:
+        path = spotify.tag(src, sub, want, cover)
+    except subprocess.TimeoutExpired as e:
+        raise DownloadError("failed", "timeout") from e
+    except (subprocess.SubprocessError, OSError) as e:
+        raise DownloadError("failed", "processing") from e
+    if path.stat().st_size > limit:
+        raise DownloadError("file_too_big")
+    return File(path, "audio", title=_short(want.title, 128), performer=_short(want.artist, 128), duration=want.duration, thumb=thumb,
+                filename=path.name)  # fmt: skip
+
+
+def _spotify(url: str, workdir: Path, cookies: str | None, limit: int) -> Media | Playlist:
+    try:
+        what, ident = spotify.resolve(url)
+        if what != "track":
+            listed: Tracklist = spotify.tracklist(what, ident)
+            return Playlist(listed.kind, listed.title, listed.owner, listed.ids)
+    except SpotifyError as e:
+        raise DownloadError(str(e), "unsupported" if str(e) == "nomedia" else None) from e
+    file = spotify_track(ident, workdir, cookies, limit)
+    return Media(
+        None, file.path, file.title or "audio", file.performer, file.duration, None, None, thumb=file.thumb, audio_name=file.filename
+    )
+
+
+# --- TikTok ------------------------------------------------------------------
+
+
+def _resolve(url: str) -> str:
+    """vm.tiktok.com, vt.tiktok.com и tiktok.com/t/… — короткие ссылки: куда они ведут (фото-пост или ролик)."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host.startswith(("vm.", "vt.")) or parsed.path.startswith("/t/"):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": BROWSER_AGENT}, method="HEAD")
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return response.geturl()
+        except OSError:
+            return url
+    return url
+
+
+def _tiktok_photos(user: str, post: str, workdir: Path, cookies: str | None, limit: int) -> Media:
+    """Фото-пост TikTok: слайды со страницы поста и звук — тот же пост как «ролик» отдаёт yt-dlp."""
+    page = f"https://www.tiktok.com/@{user}/video/{post}"
+    try:
+        with yt_dlp.YoutubeDL(_options(workdir, cookies, "b")) as ydl:
+            data, _status = ydl.get_info_extractor("TikTok")._extract_web_data_and_status(page, post)
+    except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+        raise _ydl_error(e) from e
+    images = ((data or {}).get("imagePost") or {}).get("images") or []
+    urls = [(img.get("imageURL") or {}).get("urlList") or [] for img in images]
+    gallery = _gallery([("photo", u[0]) for u in urls if u], workdir, limit)
+    if not gallery:
+        raise DownloadError("nomedia")
+    media = Media(None, None, _short(data.get("desc")) or "TikTok", None, None, None, None, gallery=gallery)
+    music = data.get("music") or {}
+    try:
+        info, src = _download(page, workdir, cookies, "ba/b", max(limit, SMALL_DOWNLOAD))
+        sound = _processed(info, src, workdir, True, limit)
+        media.audio, media.duration = sound.audio, sound.duration
+        media.title = _short(music.get("title")) or sound.title
+        media.performer = _short(music.get("authorName")) or sound.performer
+    except DownloadError:
+        pass  # слайды без звука — тоже результат
+    return media
+
+
+# --- Instagram ---------------------------------------------------------------
+
+
+def _instagram_link(url: str, workdir: Path, cookies: str | None, limit: int) -> Media:
+    what, key = instagram.target(url) or ("", "")
+    if what == "audio":
+        raise DownloadError("nomedia", "unsupported")
+    loader = _instagram()
+    if what == "post" and not loader.logged_in:
+        # Без входа reels часто отдаёт yt-dlp; фото и карусели — нет.
+        try:
+            info, src = _download(url, workdir, cookies, SOCIAL_FORMAT, max(limit, SMALL_DOWNLOAD))
+            return _processed(info, src, workdir, limit=limit)
+        except DownloadError as e:
+            if e.code not in ("nomedia", "private", "failed", "busy"):
+                raise
+    try:
+        gallery = loader.fetch(what, key)
+    except InstagramError as e:
+        raise DownloadError(str(e)) from e
+    files = _gallery(gallery.items, workdir, limit)
+    if not files:
+        raise DownloadError("nomedia")
+    if what == "post" and len(files) == 1 and files[0].kind == "video":
+        # Один ролик — как раньше: видео и его звук отдельным треком.
+        media = _processed({"title": gallery.title}, files[0].path, workdir, limit=limit)
+        media.title = _short(gallery.title) or "Instagram"
+        return media
+    return Media(None, None, _short(gallery.title, 200) or "Instagram", None, None, None, None, gallery=files)
+
+
+# --- вход --------------------------------------------------------------------
+
+
+def download(url: str, workdir: Path, cookies: str | None = None, limit: int = SMALL_LIMIT) -> Media | Playlist:
+    """Синхронно: вызывать через asyncio.to_thread. limit — сколько бот может отправить одним файлом."""
+    big = limit > SMALL_LIMIT
+    if big:
+        limit = room(workdir, limit)
     match kind(url):
         case "spotify":
-            return _spotify(url, workdir, cookies)
+            return _spotify(url, workdir, cookies, limit)
+        case "instagram":
+            return _instagram_link(url, workdir, cookies, limit)
         case "youtube":
-            info = _info(url, cookies)
+            info = _info(url, workdir, cookies)
             if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
                 raise DownloadError("live")
             duration = info.get("duration") or 0
-            if duration > MAX_DURATION:
+            if duration > (BIG_DURATION if big else SMALL_DURATION):
                 raise DownloadError("too_long")
-            audio_only = duration > VIDEO_MAX_DURATION
+            audio_only = duration > (BIG_VIDEO_DURATION if big else SMALL_VIDEO_DURATION)
             target = info.get("webpage_url") or url
-            info, src = _download(target, workdir, cookies, AUDIO_FORMAT if audio_only else YOUTUBE_FORMAT)
-            media = _processed(info, src, workdir, audio_only)
+            fmt = AUDIO_FORMAT if audio_only else youtube_format(limit)
+            info, src = _download(target, workdir, cookies, fmt, max(limit, SMALL_DOWNLOAD))
+            media = _processed(info, src, workdir, audio_only, limit)
             if audio_only:
                 media.video_too_big, media.long_video = False, True
             return media
         case _:
-            info, src = _download(url, workdir, cookies, SOCIAL_FORMAT)
-            return _processed(info, src, workdir)
+            url = _resolve(url)
+            photo = TIKTOK_PHOTO.match(url)
+            if photo:
+                return _tiktok_photos(photo.group(1), photo.group(2), workdir, cookies, limit)
+            info, src = _download(url, workdir, cookies, SOCIAL_FORMAT, max(limit, SMALL_DOWNLOAD))
+            return _processed(info, src, workdir, limit=limit)
