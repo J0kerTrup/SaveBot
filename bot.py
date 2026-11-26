@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -11,6 +12,7 @@ import tempfile
 import time
 from collections import OrderedDict, defaultdict, deque
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -34,13 +36,26 @@ from aiogram.utils.chat_action import ChatActionSender
 
 import downloader
 import family_refs
-from downloader import SMALL_LIMIT, DownloadError, File, Playlist, download, find_links, is_profile, spotify_track
+from downloader import (
+    SMALL_LIMIT,
+    DownloadError,
+    File,
+    Playlist,
+    download,
+    find_links,
+    is_profile,
+    playlist_track,
+    youtube_list,
+    youtube_list_id,
+    youtube_video_id,
+)
 from emoji import premium, split_icon
 from family_lang import Family, sync_private
 from family_news import News
 from family_news import button as news_button
 from family_stats import Stats
 from i18n import LANGS, SITE, pick, t
+from spotify import branded
 from uploader import Uploader
 
 log = logging.getLogger("savebot")
@@ -74,6 +89,10 @@ slots = asyncio.Semaphore(PARALLEL)
 uploader = Uploader(TOKEN)
 # Чаты, где сейчас идёт плейлист: второй ждёт конца первого.
 playlists: set[int] = set()
+# Списки треков, ждущие выбора, и вопросы «трек или плейлист»: по токену из кнопок; живут час после последнего нажатия.
+pickers: OrderedDict = OrderedDict()
+choices: OrderedDict = OrderedDict()
+PICKER_TTL = 60 * 60
 recent: dict[int, deque[float]] = defaultdict(deque)
 warned: dict[int, float] = {}
 # Повторную ссылку отдаём по file_id (или копией большого файла) без нового скачивания; ключ — ссылка или «spotify:track:ID».
@@ -356,7 +375,7 @@ async def send_big(message: Message, file: File, lang: str) -> tuple:
             file.path,
             file.kind,
             caption,
-            title=file.title,
+            title=branded(file.title) if file.kind == "audio" else file.title,
             performer=file.performer,
             duration=file.duration,
             width=file.width,
@@ -387,7 +406,7 @@ async def send_one(message: Message, file: File, lang: str) -> tuple:
         thumb = FSInputFile(file.thumb) if file.thumb else None
         sent = await obey(
             lambda: message.reply_audio(
-                upload, caption=caption, title=file.title, performer=file.performer, duration=file.duration, thumbnail=thumb
+                upload, caption=caption, title=branded(file.title), performer=file.performer, duration=file.duration, thumbnail=thumb
             )
         )
         return ("audio", sent.audio.file_id if sent.audio else None)
@@ -407,7 +426,7 @@ def _input(item: File | tuple, with_caption: bool):
     if what == "video":
         extra = {} if isinstance(item, tuple) else {"duration": item.duration, "width": item.width, "height": item.height}
         return InputMediaVideo(media=media, caption=text, supports_streaming=True, **extra)
-    extra = {} if isinstance(item, tuple) else {"title": item.title, "performer": item.performer, "duration": item.duration}
+    extra = {} if isinstance(item, tuple) else {"title": branded(item.title), "performer": item.performer, "duration": item.duration}
     if not isinstance(item, tuple) and item.thumb:
         extra["thumbnail"] = FSInputFile(item.thumb)
     return InputMediaAudio(media=media, caption=text, **extra)
@@ -438,7 +457,7 @@ async def send_ref(message: Message, ref: tuple) -> tuple:
     return ref
 
 
-async def send_many(message: Message, items: list[File | tuple], lang: str) -> list[tuple]:
+async def send_many(message: Message, items: list[File | tuple], lang: str, captioned: bool = True) -> list[tuple]:
     """Файлы и ссылки кеша альбомами по 10 (фото с видео вместе, звук отдельно); большие и копии — по одному."""
     refs: list[tuple] = []
     group: list[File | tuple] = []
@@ -451,7 +470,7 @@ async def send_many(message: Message, items: list[File | tuple], lang: str) -> l
             item = group[0]
             refs.append(await send_one(message, item, lang) if isinstance(item, File) else await send_ref(message, item))
         elif group:
-            media = [_input(item, i == 0) for i, item in enumerate(group)]
+            media = [_input(item, captioned and i == 0) for i, item in enumerate(group)]
             sent = await obey(lambda: message.reply_media_group(media))
             refs.extend(_ref(s) for s in sent)
         group.clear()
@@ -478,6 +497,21 @@ async def resend(message: Message, refs: list[tuple]) -> None:
 
 
 async def handle(message: Message, bot: Bot, url: str, attempt: str | None = None) -> None:
+    if downloader.kind(url) == "youtube" and youtube_list_id(url):
+        lang = lang_of(message.chat.id, message.from_user)
+        if youtube_video_id(url):
+            # Ролик внутри плейлиста или микса: спросить, нужен он один или весь список.
+            await ask_youtube(message, url, lang, attempt)
+            return
+        stats.started(attempt)
+        try:
+            playlist = await asyncio.to_thread(youtube_list, url)
+        except DownloadError as e:
+            stats.finished(attempt, "fail", e.why, e.code)
+            await message.reply(premium("❌ " + t(lang, str(e))))
+            return
+        await offer_playlist(message, playlist, lang, attempt)
+        return
     if url in cache:
         stats.hit("result", "cached")
         await resend(message, cache[url])
@@ -496,7 +530,7 @@ async def handle(message: Message, bot: Bot, url: str, attempt: str | None = Non
                 await message.reply(premium("❌ " + t(lang, str(e))))
                 return
             if isinstance(result, Playlist):
-                await deliver_playlist(message, result, Path(tmp), lang, attempt)
+                await offer_playlist(message, result, lang, attempt)
                 return
             media = result
 
@@ -532,70 +566,275 @@ async def handle(message: Message, bot: Bot, url: str, attempt: str | None = Non
             stats.finished(attempt, "fail", "too_big", "no_file")
 
 
-async def deliver_playlist(message: Message, playlist: Playlist, workdir: Path, lang: str, attempt: str | None) -> None:
-    """Альбом, плейлист или топ исполнителя: треки качаются по одному и уходят альбомами по 10; одно сообщение о ходе."""
-    private = message.chat.type == ChatType.PRIVATE
-    cap = PLAYLIST_PRIVATE if private else PLAYLIST_GROUP
-    ids = playlist.ids[:cap]
-    if message.chat.id in playlists:
-        await message.reply(premium("⏳ " + t(lang, "playlist_busy")))
-        stats.finished(attempt, "fail", "other", "busy")
+@dataclass
+class Picker:
+    """Список треков альбома или плейлиста, из которого человек выбирает, что скачать."""
+
+    playlist: Playlist
+    source: Message  # сообщение со ссылкой: треки приходят ответом на него
+    owner: int  # кто прислал ссылку: только он выбирает
+    lang: str
+    chosen: set[int] = field(default_factory=set)
+    at: float = field(default_factory=time.monotonic)
+
+
+def _clock(seconds: int | None) -> str:
+    return f"{seconds // 60}:{seconds % 60:02d}" if seconds else ""
+
+
+def _shown(picker: Picker) -> int:
+    """Сколько треков в списке (встраиваемая страница отдаёт до 50)."""
+    return min(len(picker.playlist.ids), PLAYLIST_PRIVATE)
+
+
+def _most(picker: Picker) -> int:
+    """Сколько треков можно скачать за раз: в группе меньше, чтобы не завалить разговор."""
+    return min(_shown(picker), PLAYLIST_PRIVATE if picker.source.chat.type == ChatType.PRIVATE else PLAYLIST_GROUP)
+
+
+def picker_header(picker: Picker) -> str:
+    """Шапка списка: название, чей, сколько треков. Она остаётся над треками и после скачивания — подпись бота тоже в ней."""
+    pl = picker.playlist
+    lang = picker.lang
+    owner = html.escape(" ".join((pl.owner or "").split()))
+    kind = t(lang, f"kind_{pl.kind}") if pl.kind in ("album", "playlist", "artist") else ""
+    meta = " · ".join(x for x in (owner, kind, t(lang, "tracks_count").format(n=len(pl.ids))) if x)
+    return f"🎵 <b>{html.escape(pl.title)}</b>\n{meta}"
+
+
+def picker_text(picker: Picker) -> str:
+    pl = picker.playlist
+    width = 48
+    while True:
+        lines = []
+        for i, (name, artists, seconds) in enumerate(pl.names[: _shown(picker)], 1):
+            label = f"{artists} — {name}" if artists else name
+            label = label if len(label) <= width else label[: width - 1] + "…"
+            mark = "✅ " if i - 1 in picker.chosen else ""
+            lines.append(f"{mark}<b>{i}.</b> {html.escape(label)} <i>{_clock(seconds)}</i>".rstrip())
+        hint = t(picker.lang, "pick_hint")
+        if _most(picker) < _shown(picker):
+            hint += "\n" + t(picker.lang, "pick_group_limit").format(n=_most(picker))
+        text = picker_header(picker) + "\n\n" + "\n".join(lines) + "\n\n" + hint
+        if len(text) < 3900 or width <= 20:
+            return text
+        width -= 6
+
+
+def picker_markup(token: str, picker: Picker) -> InlineKeyboardMarkup:
+    lang = picker.lang
+    count = _shown(picker)
+    numbers = [
+        InlineKeyboardButton(text=str(i + 1), callback_data=f"pl:{token}:{i}", style="success" if i in picker.chosen else None)
+        for i in range(count)
+    ]
+    rows = [numbers[i : i + 5] for i in range(0, len(numbers), 5)]
+    if picker.chosen:
+        rows.append([button(t(lang, "pick_selected").format(n=len(picker.chosen)), f"pl:{token}:go", "success")])
+    if count <= _most(picker):
+        rows.append([button(t(lang, "pick_all").format(n=count), f"pl:{token}:all", "primary")])
+    rows.append([button(t(lang, "pick_cancel"), f"pl:{token}:x")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _token(store: OrderedDict) -> str:
+    now = time.monotonic()
+    for old in [k for k, item in store.items() if now - item.at > PICKER_TTL]:
+        store.pop(old, None)
+    while len(store) >= 500:
+        store.pop(next(iter(store)))
+    return secrets.token_urlsafe(6)
+
+
+async def offer_playlist(message: Message, playlist: Playlist, lang: str, attempt: str | None, edit: Message | None = None) -> None:
+    """Альбом или плейлист: сначала список — человек выбирает треки или «скачать все», бот ничего не качает зря.
+    edit — сообщение бота, которое становится списком (вопрос «трек или плейлист»); иначе список — ответом на ссылку."""
+    token = _token(pickers)
+    owner = message.from_user.id if message.from_user else 0
+    picker = Picker(playlist, message, owner, lang)
+    pickers[token] = picker
+    text, markup = premium(picker_text(picker)), picker_markup(token, picker)
+    if edit:
+        await obey(lambda: edit.edit_text(text, reply_markup=markup))
+    else:
+        await obey(lambda: message.reply(text, reply_markup=markup))
+    stats.hit("result", "picker")
+    stats.finished(attempt, "ok", detail="picker")
+
+
+@dataclass
+class Choice:
+    """Ссылка на ролик внутри плейлиста YouTube: ждёт ответа «только этот» или «весь плейлист»."""
+
+    url: str
+    source: Message
+    owner: int
+    lang: str
+    at: float = field(default_factory=time.monotonic)
+
+
+async def ask_youtube(message: Message, url: str, lang: str, attempt: str | None) -> None:
+    token = _token(choices)
+    choices[token] = Choice(url, message, message.from_user.id if message.from_user else 0, lang)
+    rows = [
+        [button(t(lang, "yt_one"), f"yt:{token}:one", "primary")],
+        [button(t(lang, "yt_list"), f"yt:{token}:list")],
+    ]
+    await obey(lambda: message.reply(premium("🎵 " + t(lang, "yt_choose")), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)))
+    stats.finished(attempt, "ok", detail="choice")
+
+
+@dp.callback_query(F.data.startswith("yt:"))
+async def choose_youtube(query: CallbackQuery, bot: Bot) -> None:
+    _, token, action = (query.data or "::").split(":", 2)
+    choice = choices.get(token)
+    msg = query.message
+    lang = choice.lang if choice else lang_of(query.from_user.id, query.from_user)
+    if not choice or not isinstance(msg, Message):
+        await query.answer(t(lang, "pick_expired"), show_alert=True)
         return
-    playlists.add(message.chat.id)
-    title = html.escape(playlist.title)
-    status = await obey(lambda: message.reply(premium("🎵 " + t(lang, "playlist").format(title=title, done=0, total=len(ids)))))
-    last = time.monotonic()
+    if query.from_user.id != choice.owner:
+        await query.answer(t(lang, "pick_owner_only"), show_alert=True)
+        return
+    if not allowed(msg.chat.id):
+        await query.answer(t(lang, "rate_limited"), show_alert=True)
+        return
+    choices.pop(token, None)
+    await query.answer()
+    if action == "one":
+        with suppress(TelegramAPIError):
+            await msg.delete()
+        await handle(choice.source, bot, f"https://www.youtube.com/watch?v={youtube_video_id(choice.url)}")
+        return
+    with suppress(TelegramAPIError):
+        await msg.edit_text(premium("⏳ " + t(lang, "yt_loading")))
+    try:
+        playlist = await asyncio.to_thread(youtube_list, choice.url)
+    except DownloadError as e:
+        with suppress(TelegramAPIError):
+            await msg.edit_text(premium("❌ " + t(lang, str(e))))
+        return
+    await offer_playlist(choice.source, playlist, lang, None, edit=msg)
+
+
+@dp.callback_query(F.data.startswith("pl:"))
+async def choose_tracks(query: CallbackQuery) -> None:
+    _, token, action = (query.data or "::").split(":", 2)
+    picker = pickers.get(token)
+    msg = query.message
+    lang = picker.lang if picker else lang_of(query.from_user.id, query.from_user)
+    if not picker or not isinstance(msg, Message):
+        await query.answer(t(lang, "pick_expired"), show_alert=True)
+        return
+    if query.from_user.id != picker.owner:
+        await query.answer(t(lang, "pick_owner_only"), show_alert=True)
+        return
+    picker.at = time.monotonic()
+    count = _shown(picker)
+
+    if action == "x":
+        pickers.pop(token, None)
+        await query.answer()
+        with suppress(TelegramAPIError):
+            await msg.delete()
+        return
+
+    if action.isdigit():
+        index = int(action)
+        if index >= count:
+            await query.answer()
+            return
+        if index in picker.chosen:
+            picker.chosen.discard(index)
+        elif len(picker.chosen) >= _most(picker):
+            await query.answer(t(lang, "pick_group_limit").format(n=_most(picker)), show_alert=True)
+            return
+        else:
+            picker.chosen.add(index)
+        await query.answer()
+        with suppress(TelegramBadRequest):
+            await msg.edit_text(premium(picker_text(picker)), reply_markup=picker_markup(token, picker))
+        return
+
+    indexes = sorted(picker.chosen) if action == "go" else list(range(_most(picker)))
+    if not indexes:
+        await query.answer(t(lang, "pick_nothing"), show_alert=True)
+        return
+    if msg.chat.id in playlists:
+        await query.answer(t(lang, "playlist_busy"), show_alert=True)
+        return
+    if not allowed(msg.chat.id):
+        await query.answer(t(lang, "rate_limited"), show_alert=True)
+        return
+    pickers.pop(token, None)
+    await query.answer()
+    await download_tracks(picker, msg, indexes)
+
+
+async def download_tracks(picker: Picker, status: Message, indexes: list[int]) -> None:
+    """Выбранные треки: качаются по одному и уходят альбомами по 10 без подписи под каждым; ход и подпись бота — в шапке сверху."""
+    source, lang, pl = picker.source, picker.lang, picker.playlist
+    ids = [pl.ids[i] for i in indexes]
+    # Тот же ключ, что у одиночной ссылки на трек: повтор из кеша.
+    prefix = "youtube:track" if pl.kind == "youtube" else "spotify:track"
+    header = picker_header(picker)
+    playlists.add(source.chat.id)
     sent = missed = 0
     pending: list[tuple[str, File | tuple]] = []
+    last = time.monotonic()
 
-    async def flush() -> None:
-        nonlocal sent
-        if not pending:
-            return
-        refs = await send_many(message, [item for _, item in pending], lang)
-        for (track_id, _), ref in zip(pending, refs, strict=False):
-            if ref and ref[-1]:
-                remember(f"spotify:track:{track_id}", [ref])
-        sent += len(pending)
-        for track_id, item in pending:
-            if isinstance(item, File):
-                shutil.rmtree(workdir / track_id, ignore_errors=True)
-        pending.clear()
+    async def show(text: str) -> None:
+        with suppress(TelegramAPIError):
+            await status.edit_text(premium(f"{header}\n\n{text}\n\n{caption}"), reply_markup=None)
 
+    await show("⏳ " + t(lang, "playlist").format(done=0, total=len(ids)))
     try:
-        for i, track_id in enumerate(ids, 1):
-            cached = cache.get(f"spotify:track:{track_id}")
-            if cached:
-                pending.append((track_id, cached[0]))
-            else:
-                try:
-                    file = await asyncio.to_thread(spotify_track, track_id, workdir, COOKIES, uploader.limit)
-                    pending.append((track_id, file))
-                except DownloadError:
-                    missed += 1
-            if len(pending) == 10:
-                await flush()
-            if time.monotonic() - last >= PROGRESS_EVERY:
-                last = time.monotonic()
-                with suppress(TelegramAPIError):
-                    await status.edit_text(premium("🎵 " + t(lang, "playlist").format(title=title, done=i, total=len(ids))))
-        await flush()
-    finally:
-        playlists.discard(message.chat.id)
+        async with (
+            slots,
+            ChatActionSender.upload_document(bot=status.bot, chat_id=source.chat.id, message_thread_id=source.message_thread_id),
+        ):
+            with tempfile.TemporaryDirectory(prefix="savebot-") as tmp:
+                workdir = Path(tmp)
 
-    text = "✅ " + t(lang, "playlist_done").format(title=title, sent=sent, total=len(ids))
+                async def flush() -> None:
+                    nonlocal sent
+                    if not pending:
+                        return
+                    refs = await send_many(source, [item for _, item in pending], lang, captioned=False)
+                    for (track_id, _), ref in zip(pending, refs, strict=False):
+                        if ref and ref[-1]:
+                            remember(f"{prefix}:{track_id}", [ref])
+                    sent += len(pending)
+                    for track_id, item in pending:
+                        if isinstance(item, File):
+                            shutil.rmtree(workdir / track_id, ignore_errors=True)
+                    pending.clear()
+
+                for i, track_id in enumerate(ids, 1):
+                    cached = cache.get(f"{prefix}:{track_id}")
+                    if cached:
+                        pending.append((track_id, cached[0]))
+                    else:
+                        try:
+                            pending.append(
+                                (track_id, await asyncio.to_thread(playlist_track, pl, track_id, workdir, COOKIES, uploader.limit))
+                            )
+                        except DownloadError:
+                            missed += 1
+                    if len(pending) == 10:
+                        await flush()
+                    if time.monotonic() - last >= PROGRESS_EVERY:
+                        last = time.monotonic()
+                        await show("⏳ " + t(lang, "playlist").format(done=i, total=len(ids)))
+                await flush()
+    finally:
+        playlists.discard(source.chat.id)
+
+    text = "✅ " + t(lang, "playlist_done").format(sent=sent, total=len(ids))
     if missed:
         text += "\n" + t(lang, "playlist_missed").format(n=missed)
-    if len(playlist.ids) > len(ids):
-        text += "\n" + t(lang, "playlist_cut_private" if private else "playlist_cut_group").format(n=len(ids))
-    with suppress(TelegramAPIError):
-        await status.edit_text(premium(text))
-    if sent:
-        stats.hit("result", "playlist")
-        stats.finished(attempt, "ok", detail="playlist")
-    else:
-        stats.hit("result", "fail")
-        stats.finished(attempt, "fail", "unavailable", "notfound")
+    await show(text)
+    stats.hit("result", "playlist" if sent else "fail")
 
 
 @dp.message(F.chat.type == ChatType.PRIVATE)

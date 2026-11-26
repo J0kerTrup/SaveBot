@@ -131,3 +131,84 @@ def test_yt_dlp_gets_a_copy_of_the_cookies(tmp_path):
     work.mkdir()
     opts = downloader._options(work, str(session), "b")
     assert opts["cookiefile"] == str(work / "cookies.txt") and (work / "cookies.txt").exists()
+
+
+def test_youtube_links_with_a_list():
+    mix = "https://www.youtube.com/watch?v=fLqzpjkDqCo&list=RDfLqzpjkDqCo&start_radio=1"
+    assert downloader.kind(mix) == "youtube"
+    assert downloader.youtube_list_id(mix) == "RDfLqzpjkDqCo" and downloader.youtube_video_id(mix) == "fLqzpjkDqCo"
+    only_list = "https://www.youtube.com/playlist?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG"
+    assert downloader.kind(only_list) == "youtube" and downloader.youtube_video_id(only_list) is None
+    assert downloader.youtube_list_id("https://www.youtube.com/watch?v=fLqzpjkDqCo") is None
+    assert spotify.branded("Song") == "Song | @HUBPIXELBOT" and spotify.branded("Song | @HUBPIXELBOT") == "Song | @HUBPIXELBOT"
+
+
+def picker_message(chat_type="private", user=1):
+    sent = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=5, type=chat_type),
+        message_id=7,
+        message_thread_id=None,
+        from_user=SimpleNamespace(id=user, language_code="ru"),
+        reply=AsyncMock(return_value=sent),
+    )
+
+
+def playlist(n=50):
+    names = [(f"Очень длинное название трека номер {i} (feat. Кто-то ещё)", "Исполнитель, Второй", 200) for i in range(n)]
+    return downloader.Playlist("album", "Альбом", "Исполнитель", [f"id{i}" for i in range(n)], names)
+
+
+async def test_an_album_asks_which_tracks_first(monkeypatch):
+    bot.pickers.clear()
+    source = picker_message()
+    await bot.offer_playlist(source, playlist(), "ru", None)
+    text = source.reply.call_args.args[0]
+    markup = source.reply.call_args.kwargs["reply_markup"]
+    assert len(text) < 4096 and "Альбом" in text
+    numbers = [b for row in markup.inline_keyboard for b in row if b.text.isdigit()]
+    assert len(numbers) == 50
+    token = next(iter(bot.pickers))
+
+    got = []
+
+    async def fake_download(picker, status, indexes):
+        got.append(indexes)
+
+    monkeypatch.setattr(bot, "download_tracks", fake_download)
+    status = SimpleNamespace(chat=source.chat, edit_text=AsyncMock(), delete=AsyncMock())
+
+    def press(data, user=1):
+        return SimpleNamespace(data=data, message=status, from_user=SimpleNamespace(id=user, language_code="ru"), answer=AsyncMock())
+
+    monkeypatch.setattr(bot, "Message", SimpleNamespace)
+    stranger = press(f"pl:{token}:3", user=2)
+    await bot.choose_tracks(stranger)
+    assert stranger.answer.call_args.kwargs.get("show_alert") and not bot.pickers[token].chosen
+    await bot.choose_tracks(press(f"pl:{token}:3"))
+    await bot.choose_tracks(press(f"pl:{token}:0"))
+    assert bot.pickers[token].chosen == {0, 3}
+    await bot.choose_tracks(press(f"pl:{token}:go"))
+    assert got == [[0, 3]] and token not in bot.pickers
+
+
+async def test_in_a_group_a_long_album_has_no_download_all():
+    bot.pickers.clear()
+    source = picker_message("supergroup")
+    await bot.offer_playlist(source, playlist(), "ru", None)
+    labels = [b.text for row in source.reply.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
+    assert not any("Скачать все" in label for label in labels)
+    assert "не больше 10" in source.reply.call_args.args[0]
+
+
+async def test_a_video_inside_a_playlist_asks_first(monkeypatch):
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE chat_lang (chat_id INTEGER PRIMARY KEY, lang TEXT NOT NULL)")
+    monkeypatch.setattr(bot, "db", db, raising=False)
+    bot.choices.clear()
+    source = picker_message()
+    await bot.handle(source, None, "https://www.youtube.com/watch?v=fLqzpjkDqCo&list=RDfLqzpjkDqCo")
+    markup = source.reply.call_args.kwargs["reply_markup"]
+    assert [b.callback_data.rsplit(":", 1)[1] for row in markup.inline_keyboard for b in row] == ["one", "list"]

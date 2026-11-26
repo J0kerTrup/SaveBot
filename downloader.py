@@ -11,7 +11,7 @@ import subprocess
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
@@ -43,6 +43,7 @@ SMALL_DOWNLOAD = 150 * 1024 * 1024
 # Свободное место, которое скачивание не трогает: автодеплою нужно 2 ГБ, логам и базам — ещё немного.
 DISK_RESERVE = 2_500 * 1024 * 1024
 GALLERY_ITEM_MAX = 200 * 1024 * 1024  # один файл из поста или сторис
+PLAYLIST_MAX = 50  # треков в списке плейлиста
 
 SOCIAL_FORMAT = (
     # H.264 играет во всех клиентах Telegram; формат download у TikTok — с водяным знаком. Нет ролика (фото-пост) — один звук.
@@ -129,6 +130,7 @@ class Playlist:
     title: str
     owner: str | None
     ids: list[str]
+    names: list[tuple[str, str, int | None]] = field(default_factory=list)
 
 
 ig: Instagram | None = None
@@ -150,7 +152,7 @@ def kind(url: str) -> str | None:
     """youtube, spotify, instagram, tiktok или None — такую ссылку бот пропускает молча."""
     host = (urlparse(url).hostname or "").lower()
     if host.endswith(("youtube.com", "youtu.be")):
-        return "youtube" if YOUTUBE_VIDEO.match(url) else None
+        return "youtube" if YOUTUBE_VIDEO.match(url) or youtube_list_id(url) else None
     if host.endswith("spotify.com"):
         return "spotify" if spotify.LINK.match(url) else None
     if host == "spotify.link":
@@ -212,7 +214,7 @@ def _ydl_error(e: Exception) -> DownloadError:
         return DownloadError("nomedia", "unsupported")
     if "live event" in msg or "is live" in msg or "premieres in" in msg:
         return DownloadError("live")
-    if "removed" in msg or "deleted" in msg or "no longer available" in msg or "video unavailable" in msg or "terminated" in msg:
+    if any(w in msg for w in ("removed", "deleted", "no longer available", "video unavailable", "terminated", "does not exist")):
         return DownloadError("removed")
     if "429" in msg or "too many requests" in msg or "rate-limit" in msg:
         return DownloadError("busy")
@@ -382,6 +384,10 @@ def _gallery(items: list[tuple[str, str]], workdir: Path, limit: int) -> list[Fi
 # --- Spotify -----------------------------------------------------------------
 
 
+# Обложка трека квадратная: превью YouTube (16:9) обрезается по центру.
+SQUARE = "crop='min(iw,ih)':'min(iw,ih)',scale=320:320"
+
+
 def _cover(url: str | None, workdir: Path, name: str = "cover") -> tuple[Path | None, Path | None]:
     """Обложка: полная (640 px, внутрь файла) и миниатюра для Telegram (JPEG до 320 px и 200 КБ)."""
     if not url or not url.startswith("https://"):
@@ -390,7 +396,7 @@ def _cover(url: str | None, workdir: Path, name: str = "cover") -> tuple[Path | 
         full = _fetch(url, workdir / f"{name}.jpg", 5_000_000, USER_AGENT)
         thumb = workdir / f"{name}-thumb.jpg"
         subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(full), "-vf", "scale=320:320", "-q:v", "4", str(thumb)],
+            ["ffmpeg", "-y", "-v", "error", "-i", str(full), "-vf", SQUARE, "-q:v", "4", str(thumb)],
             capture_output=True,
             timeout=60,
             check=True,
@@ -427,12 +433,91 @@ def spotify_track(track_id: str, workdir: Path, cookies: str | None = None, limi
                 filename=path.name)  # fmt: skip
 
 
+# --- YouTube: плейлисты ---------------------------------------------------------
+
+
+def youtube_list_id(url: str) -> str | None:
+    """Плейлист в ссылке YouTube (list=…): обычный, микс (RD…) или альбом YouTube Music."""
+    found = parse_qs(urlparse(url).query).get("list")
+    value = found[0] if found else None
+    return value if value and re.fullmatch(r"[\w-]{10,}", value) and value not in ("WL", "LL") else None
+
+
+def youtube_video_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    if (parsed.hostname or "").endswith("youtu.be"):
+        return parsed.path.strip("/").split("/")[0] or None
+    found = parse_qs(parsed.query).get("v")
+    if found:
+        return found[0]
+    m = re.search(r"/(?:shorts|embed|live)/([\w-]{6,})", parsed.path)
+    return m.group(1) if m else None
+
+
+def youtube_list(url: str) -> Playlist:
+    """Треки плейлиста YouTube без скачивания: названия, авторы и длительность — для списка, из которого выбирают. Синхронно."""
+    list_id = youtube_list_id(url)
+    if not list_id:
+        raise DownloadError("nomedia", "unsupported")
+    video = youtube_video_id(url)
+    # Микс (RD…) существует только вместе с роликом, с которого начат; обычный плейлист — сам по себе.
+    target = (
+        f"https://www.youtube.com/watch?v={video}&list={list_id}"
+        if video and list_id.startswith("RD")
+        else (f"https://www.youtube.com/playlist?list={list_id}")
+    )
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True, "playlistend": PLAYLIST_MAX}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        raise _ydl_error(e) from e
+    entries = [e for e in info.get("entries") or [] if e and e.get("id") and (e.get("duration") or 0) <= BIG_DURATION]
+    entries = [e for e in entries if e.get("title") not in ("[Private video]", "[Deleted video]")][:PLAYLIST_MAX]
+    if not entries:
+        raise DownloadError("nomedia")
+    names = [
+        (e.get("title") or "?", (e.get("channel") or e.get("uploader") or "").removesuffix(" - Topic"), e.get("duration")) for e in entries
+    ]
+    title = info.get("title") or "YouTube"
+    return Playlist("youtube", title, info.get("channel") or info.get("uploader"), [e["id"] for e in entries], names)
+
+
+def youtube_track(video_id: str, workdir: Path, cookies: str | None = None, limit: int = SMALL_LIMIT) -> File:
+    """Один ролик плейлиста звуком (m4a без перекодирования) с названием, исполнителем и обложкой. Синхронно."""
+    sub = workdir / video_id
+    sub.mkdir(exist_ok=True)
+    info, src = _download(f"https://www.youtube.com/watch?v={video_id}", sub, cookies, AUDIO_FORMAT, max(limit, SMALL_DOWNLOAD))
+    if info.get("is_live"):
+        raise DownloadError("live")
+    artist = info.get("artist") or ((info.get("artists") or [None])[0]) or (info.get("uploader") or "").removesuffix(" - Topic")
+    want = spotify.Track(video_id, info.get("track") or info.get("title") or "audio", [artist] if artist else [], album=info.get("album"),
+                         duration=round(info["duration"]) if info.get("duration") else None)  # fmt: skip
+    _, thumb = _cover(info.get("thumbnail"), sub)
+    try:
+        path = spotify.tag(src, sub, want, thumb, source=f"https://youtu.be/{video_id}")
+    except subprocess.TimeoutExpired as e:
+        raise DownloadError("failed", "timeout") from e
+    except (subprocess.SubprocessError, OSError) as e:
+        raise DownloadError("failed", "processing") from e
+    if path.stat().st_size > limit:
+        raise DownloadError("file_too_big")
+    return File(path, "audio", title=_short(want.title, 128), performer=_short(want.artist, 128), duration=want.duration, thumb=thumb,
+                filename=path.name)  # fmt: skip
+
+
+def playlist_track(playlist: Playlist, item_id: str, workdir: Path, cookies: str | None = None, limit: int = SMALL_LIMIT) -> File:
+    """Трек списка: Spotify — найти и скачать запись, YouTube — звук ролика."""
+    fetch = youtube_track if playlist.kind == "youtube" else spotify_track
+    return fetch(item_id, workdir, cookies, limit)
+
+
 def _spotify(url: str, workdir: Path, cookies: str | None, limit: int) -> Media | Playlist:
     try:
         what, ident = spotify.resolve(url)
         if what != "track":
             listed: Tracklist = spotify.tracklist(what, ident)
-            return Playlist(listed.kind, listed.title, listed.owner, listed.ids)
+            return Playlist(listed.kind, listed.title, listed.owner, listed.ids, listed.names)
     except SpotifyError as e:
         raise DownloadError(str(e), "unsupported" if str(e) == "nomedia" else None) from e
     file = spotify_track(ident, workdir, cookies, limit)

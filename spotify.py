@@ -21,6 +21,16 @@ log = logging.getLogger("savebot.spotify")
 LINK = re.compile(r"https?://open\.spotify\.com/(?:intl-[a-z-]+/)?(track|album|playlist|artist)/([A-Za-z0-9]{10,})", re.IGNORECASE)
 # С полным User-Agent браузера Spotify отдаёт страницу без метатегов, с коротким — с ними.
 USER_AGENT = "Mozilla/5.0"
+# Подпись семьи ботов в названии каждой дорожки: «Название | @HUBPIXELBOT» — в Telegram и в тегах файла (решение владельца).
+BRAND = "@HUBPIXELBOT"
+
+
+def branded(title: str | None) -> str | None:
+    if not title or title.endswith(BRAND):
+        return title
+    return f"{title} | {BRAND}"
+
+
 # Запись дальше этого от длительности трека — другая версия (live, extended, клип с интро).
 DURATION_SLACK = 12
 
@@ -51,6 +61,8 @@ class Tracklist:
     title: str
     owner: str | None
     ids: list[str] = field(default_factory=list)
+    # (название, исполнители, длительность в секундах) — для списка, из которого человек выбирает треки
+    names: list[tuple[str, str, int | None]] = field(default_factory=list)
 
 
 def _get(url: str, limit: int = 3_000_000) -> tuple[str, bytes]:
@@ -127,10 +139,15 @@ def tracklist(kind: str, list_id: str) -> Tracklist:
         entity = None
     if not entity:
         raise SpotifyError("notfound")
-    ids = [t["uri"].rsplit(":", 1)[-1] for t in entity.get("trackList") or [] if str(t.get("uri", "")).startswith("spotify:track:")]
-    if not ids:
+    tracks = [t for t in entity.get("trackList") or [] if str(t.get("uri", "")).startswith("spotify:track:")]
+    if not tracks:
         raise SpotifyError("nomedia")
-    return Tracklist(kind, entity.get("title") or entity.get("name") or "Spotify", entity.get("subtitle"), ids)
+    ids = [t["uri"].rsplit(":", 1)[-1] for t in tracks]
+    names = [
+        (t.get("title") or "?", " ".join((t.get("subtitle") or "").split()), round(t["duration"] / 1000) if t.get("duration") else None)
+        for t in tracks
+    ]
+    return Tracklist(kind, entity.get("title") or entity.get("name") or "Spotify", entity.get("subtitle"), ids, names)
 
 
 # --- поиск записи --------------------------------------------------------------
@@ -213,9 +230,12 @@ def match(want: Track) -> str | None:
 # --- файл ----------------------------------------------------------------------
 
 
-def tag(src: Path, dst_dir: Path, want: Track, cover: Path | None) -> Path:
+def tag(src: Path, dst_dir: Path, want: Track, cover: Path | None, source: str | None = None) -> Path:
     """Файл с тегами и обложкой внутри: m4a — без перекодирования; другой звук (opus) — в mp3 192 кбит/с."""
-    stem = re.sub(r'[\\/:*?"<>|]+', " ", f"{want.artist} - {want.title}" if want.artist else want.title).strip()[:120] or "track"
+    stem = (
+        re.sub(r'[\\/:*?"<>|]+', " ", f"{want.artist} - {want.title}" if want.artist else want.title).strip().rstrip(".")[:120].strip()
+        or "track"
+    )
     copy = src.suffix.lower() in (".m4a", ".mp4", ".aac")
     dst = dst_dir / f"{stem}.{'m4a' if copy else 'mp3'}"
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src)]
@@ -227,13 +247,13 @@ def tag(src: Path, dst_dir: Path, want: Track, cover: Path | None) -> Path:
     if cover:
         cmd += ["-c:v", "mjpeg" if not copy else "copy"]
     tags = {
-        "title": want.title,
+        "title": branded(want.title),
         "artist": want.artist,
         "album_artist": want.artists[0] if want.artists else None,
         "album": want.album,
         "track": str(want.number) if want.number else None,
         "date": want.date,
-        "comment": f"https://open.spotify.com/track/{want.id}",
+        "comment": source or f"https://open.spotify.com/track/{want.id}",
     }
     for key, value in tags.items():
         if value:
